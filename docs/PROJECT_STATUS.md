@@ -115,7 +115,7 @@ If you can't answer yes to all five, pause.
 **Started:** May 2026
 **Target launch:** TBD (after designs land in ~1 month + build time)
 
-**Current status:** Architecture complete (Session 3). Curated Layer static spine complete (Session 4A). Next: Session 4B — Curated Layer event data.
+**Current status:** Curated Layer designed (Sessions 4A/4B) and **applied live to Supabase** (Session 5) — 15 tables in the cloud, tiers seeded, private GitHub repo in sync. Next: Computed Layer design **or** sync workers to fill the tables.
 
 ---
 
@@ -244,6 +244,9 @@ This is the running list of features. **Fully formalized in REQUIREMENTS.md as o
 | 3 | 2026-06-02 | High-Level Architecture | ARCHITECTURE.md (11 sections, topology + data flow Mermaid diagrams, cross-cutting patterns, resolved Q-002/Q-004/Q-NEW-G/Q-NEW-H at architecture level) | ✅ Complete |
 | 4A | 2026-06-26 | Curated Layer Schema — Static Spine | `001_curated_static.sql`, `CURATED_SCHEMA_REFERENCE.md` (v0.1 — conventions + static entities) | ✅ Complete |
 | 4B | 2026-06-26 | Curated Layer Schema — Event Data | `002_curated_events.sql` (fixtures, players, match stats, lineups, player stats, odds), `CURATED_SCHEMA_REFERENCE.md` → v0.2 | ✅ Complete |
+| 5 | 2026-07-04 | Infrastructure Setup — repo + Supabase + migrations applied | Private GitHub repo `carrenio93/statesta`; Supabase project (EU/Frankfurt); `CLAUDE.md`, `.gitignore`, `README.md`, `supabase/config.toml`; **Curated migrations applied to hosted DB** (15 tables live, tiers seeded) | ✅ Complete |
+| 6 | 2026-07-04 | Sync Workers — Ingestion Design | `SYNC_INGESTION_DESIGN.md` (raw-first model + minimal `raw.api_responses` landing table, FK-ordered sync chain, upsert/`source_ref→id` resolution, endpoint→table map, EPL-2025 vertical-slice spec) | ✅ Complete |
+| 7 | 2026-07-08 | Sync Workers — EPL-2025 Spine Implementation | Working sync worker (`backend/statesta_sync/`): config, API-Football client, psycopg v3 DB helper, smoke test, raw-landing, `upsert_returning_id` + `ResolutionMap`, spine worker (leagues → league_seasons → venues → teams → standings). `raw.api_responses` migration applied. **Validated end-to-end vs EPL 2025: 1/1/20/20/20, real PL table reproduced, idempotent re-run, admin-override protection proven.** | ✅ Complete |
 | ... | TBD | (more added as we go) | | |
 
 ---
@@ -321,6 +324,19 @@ A running log of important decisions, with rationale.
 | D-065 | 2026-06-26 | **`lineups` is a single table with `formation` and `coach` denormalised onto each player row.** | Simpler reads; matches the v2.7 mental model. Coaches not yet their own entity (Q-NEW-AH). |
 | D-066 | 2026-06-26 | **`match_statistics` and `player_match_stats` capture the full API-Football field set** (incl. xG, goals prevented, duels, dribbles, penalties). | Capture-every-field (§6.1); avoids re-deriving from Raw later. `source_extra jsonb` absorbs anything new. |
 | D-067 | 2026-06-26 | **`fixtures` stores the full score breakdown — headline, half-time, full-time, extra-time, penalties — all nullable.** | Filter engine needs HT and FT markets; absent ≠ zero (§6.7) so unplayed/unreported scores read as NULL. |
+| D-068 | 2026-07-04 | **Infrastructure provisioned:** private GitHub repo `carrenio93/statesta`; Supabase project in EU/Frankfurt; Supabase CLI migration workflow; Curated migrations applied to the hosted DB (validated on local PostgreSQL 16 first). | Design was ahead of infrastructure; this makes the schema real and validated, and switches on the architect → Claude Code split. Frankfurt = lowest latency to Greece. |
+| D-069 | 2026-07-04 | **Supabase↔GitHub auto-deploy intentionally NOT connected; schema changes are applied deliberately via `supabase db push`.** | Keep the human in the loop while learning; avoid surprise auto-deploys. Can enable later if desired. |
+| D-070 | 2026-07-04 | **Migration files use Supabase timestamp naming (`<timestamp>_<name>.sql`);** the design-number names (`001_`, `002_`) are retired. Live files: `20260626120000_curated_static.sql`, `20260626120100_curated_events.sql`. | Supabase tracks and orders migrations by timestamp; the sequential-number prefixes would not be tracked correctly. |
+| D-071 | 2026-07-04 | **Raw-first ingestion confirmed, with a *minimal* `raw.api_responses` landing table** (one row per API call: verbatim `response_body jsonb` + provenance + `response_hash`). Normalization runs *from the landed raw row*, not the live HTTP response, so the fresh-call and replay paths are one code path. Full Raw layer (per-entity tables, cold archival per D-040, diffing) deferred to its own session. | Architecture already committed to raw-first (§4, §5.3, D-040); the only open choice was how much raw structure to build now. Minimal table = replayability/audit/debuggability for the cost of one extra insert, without over-building. |
+| D-072 | 2026-07-04 | **Sync order = topological sort of the curated FK graph:** `venues → leagues → league_seasons → teams → standings → fixtures → players → match_statistics / lineups / player_match_stats → odds_bookmakers / odds_markets → odds`. | A child row can't be written before its parent's surrogate `id` exists. Spine steps run once per league-season; event-data steps run per fixture (the budget-heavy bulk). |
+| D-073 | 2026-07-04 | **Upsert strategy: `INSERT … ON CONFLICT (natural key) DO UPDATE … RETURNING id`.** Natural key = `(sport, source, source_ref)` for real sport entities, `(source, source_ref)` for venues + reference lists, composite-FK for derived rows (D-057). FKs wired via an in-run `source_ref → id` resolution map with a `SELECT` fallback. `odds` is the append-only exception (insert-on-change, D-060), not upserted. | Implements D-049's surrogate-key/provenance model and gives idempotency (§6.6): re-runs never duplicate. |
+| D-074 | 2026-07-04 | **First vertical slice = EPL (league 39), season 2025, static spine only** (`leagues → teams → standings`, ~3 calls, ~61 rows). Verified by reproducing the real Premier League table via a join + an idempotency re-run. | Smallest slice that exercises all three hard parts end-to-end — raw→curated, multi-table writes, and FK resolution — with a trivially checkable result. |
+| D-075 | 2026-07-08 | **`league_seasons.cov_fixtures` = logical OR of the four `coverage.fixtures` sub-flags** (umbrella "any fixture-level coverage this season"), not a copy of one sub-flag. | The specific sub-flags are already captured by sibling columns (`cov_fixture_statistics`, `cov_lineups`, `cov_player_statistics`), so the umbrella meaning is the non-redundant, most useful reading. Raw keeps the verbatim object regardless. |
+| D-076 | 2026-07-08 | **`leagues.type` is normalized to lowercase (`'league'`/`'cup'`) in Curated;** Raw keeps the API's verbatim `"League"`. | `type` is a category/enum — a clean, case-consistent contract downstream is a data-quality gain, not a distortion. Applies to all leagues, all sources. Contrast D-051: reformatting a value the source gave us, not inventing one. |
+| D-077 | 2026-07-08 | **`venues.country_name` stays NULL when the `/teams` venue object omits country;** never copied from `team.country`. | Absent-not-invented (D-051): the venue payload doesn't assert a country, and copying one smuggles a derived assumption in as source truth. If needed later, fill properly from the dedicated `/venues` endpoint. |
+| D-078 | 2026-07-08 | **`standings.group_label` = NULL for single-table competitions;** only genuine group labels (e.g. World Cup "Group A") are stored. | API-Football echoes the competition name into `group` for single-table leagues; storing that is noise. NULL makes the column mean exactly one thing (NULL = no real grouping). Matches the schema comment. |
+| D-079 | 2026-07-08 | **Admin-owned columns are INSERT-only and must never appear in any `DO UPDATE` set** — enforced mechanically, not by convention. Registry `ADMIN_OWNED_COLUMNS` in the upsert helper raises if an admin column is in an update and refuses to run against an unregistered table. Columns: `tier_id`, `needs_review`, `suggested_tier_id`, `tier_is_admin_set`, `is_active`. | The single most important ingestion-safety behavior: a nightly re-sync must never wipe a human admin's decision (D-012, §4.2.4). Design doc hadn't spelled this out; Claude Code surfaced it. Proven against a non-default value (`tier_id='top'` survived a re-sync while `updated_at` advanced). |
+| D-080 | 2026-07-08 | **Commits go directly to `main`** for now (no feature-branch/PR flow). | Solo dev, sequential slices, no CI gate or collaborators to protect yet; matches existing history. **Revisit** the moment Stratos or anyone else commits, or CI review gates are added. |
 
 ---
 
@@ -359,37 +375,36 @@ Questions that need answering before relevant sessions can run.
 | Q-NEW-AG | "Current league" for a team — keep the denormalized `current_league_id` convenience pointer, or introduce a full `team_league_seasons` participation table? | Team-related queries; possible later refinement | Claude + User | Open — denormalized pointer chosen for MVP (Session 4A); revisit if full participation history is needed |
 | Q-NEW-AH | Coaches — keep the soft `coach_name` + `coach_source_ref` on `lineups`, or promote coaches to a `curated.coaches` entity later? | Coach-related features (none in MVP) | Claude + User | Open — soft fields chosen for MVP (Session 4B) |
 | Q-NEW-AI | Odds capture cadence (how often the sync snapshots odds) + design of the post-kickoff job that resolves `computed.closing_odds` | Closing-odds accuracy; backtest quality | User (cadence) + Claude (job) | Open — operational / Computed-layer concern; raised in Session 4B |
+| Q-NEW-AJ | Raw granularity at scale — keep one-row-per-API-call, or add per-entity raw tables when incremental diffing is built? | Full Raw-layer session | Claude | Open — per-call chosen for MVP (Session 6); revisit when diffing/archival is designed |
+| Q-NEW-AK | Pagination + rate-limit/API-budget handling for high-volume endpoints (`/players`, `/odds`, per-fixture loops) | Sync worker implementation | Claude + User | Open — operational; addressed during implementation sessions |
+| Q-NEW-AL | EPL 2025 reports `cov_odds = false` — which league-seasons actually have odds coverage on API-Football, and how does that constrain D-023 (backtest needs real captured odds) and D-025 (historical odds backfill)? | Odds session; backtest viability | User + Claude | Open — surfaced in Session 7; check coverage before the odds work |
+| Q-NEW-AM | Our ingested data is validated against the vendor itself. Do we want an independent spot-check against a non-API-Football source (at least for launch leagues) before go-live? | Data-quality / launch confidence | User | Open — surfaced in Session 7; pre-launch data-quality task |
 
 ---
 
 ## 9. Current Active Task
 
-**Session 4B: Curated Layer Schema — Event Data** — ✅ COMPLETE → **Curated Layer fully designed**
+**Session 7: Sync Workers — EPL-2025 Spine Implementation** — ✅ COMPLETE → **first real data is live in the database**
 
-Deliverables:
-- ✅ `002_curated_events.sql` — 8 event tables: `fixtures`, `players`, `match_statistics`, `lineups`, `player_match_stats`, `odds_bookmakers`, `odds_markets`, `odds` (append-only point-in-time change log)
-- ✅ `CURATED_SCHEMA_REFERENCE.md` → **v0.2** — added Part 5 (event entities), Part 6 (decisions D-060→D-067), Part 7 (questions Q-NEW-AH/AI)
-- ✅ Updated PROJECT_STATUS.md with Session 4B decisions (D-060 through D-067) and new open questions (Q-NEW-AH, Q-NEW-AI)
+Built and validated the first sync worker end-to-end. Worker package under `backend/statesta_sync/` (config, API-Football client, psycopg v3 DB helper, smoke test, raw-landing with sha256, `upsert_returning_id` + `ResolutionMap`, spine worker). The `raw.api_responses` migration is applied. Data mapping decisions locked (D-075–D-078); the admin-owned-columns guardrail made mechanical (D-079); direct-to-main convention recorded (D-080).
 
-**State of the schema:** Curated Layer = COMPLETE (migrations `001` + `002`). Not yet designed: Raw, Computed, User layers and the Configuration subsystem (each its own session). Nothing has been run against a live database yet.
+**Validation (all Part-5 criteria met):** EPL (league 39), season 2025 → `curated` counts 1 league / 1 league_season / 20 venues / 20 teams / 20 standings; the standings reproduce the real 2025/26 Premier League ladder in order (Arsenal, 85 pts); re-run is idempotent (curated unchanged, `raw` grew append-only); and the admin-override protection was proven against a non-default value (`tier_id='top'` survived a re-sync).
 
-*(Prior: 4A — static spine — ✅; Session 3 — Architecture — ✅.)*
+**State of the schema:** Curated Layer = COMPLETE and APPLIED. Raw = minimal landing table live. **Ingestion pattern proven end-to-end** for the static spine and ready to scale. Not yet ingested: fixtures, players, match_statistics, lineups, player_match_stats, odds. Still not designed: full Raw layer, Computed, User, Configuration.
+
+*(Prior: 6 — ingestion design ✅; 5 — Infrastructure ✅; 4B/4A — schema ✅; 3 — Architecture ✅.)*
 
 ---
 
-**Next session — a fork; decide at session start:**
+**Next session — Extend the worker to fixtures (Claude Code):**
 
-**Recommended → Infrastructure: GitHub repo + Supabase project + apply migrations 001/002**
-- **Goal:** Stand up the Git repo (single source of truth), add `CLAUDE.md` for Claude Code, create the Supabase project, and actually *run* `001_curated_static.sql` + `002_curated_events.sql` so the Curated schema exists for real and is validated.
-- **Why now:** The design is ahead of the infrastructure. This closes the long-standing infra-prerequisite gap, validates the two migrations (they haven't been run yet), and unblocks the architect/engineer split (Claude Code needs the repo + `CLAUDE.md`). Beginner Git session — paced accordingly.
-- **Deliverable:** working repo + Supabase project with the `curated` schema applied; governance files committed.
-
-**Alternative → Continue schema design: Computed Layer**
-- **Goal:** Design the Computed layer that reads from Curated — form snapshots (D-016), `fixture_opportunities` (D-030), Best Picks, season-completion %, and the resolved `closing_odds` table promised in D-062.
-- **Why it could be next:** It's the most coupled to what we just built, and 4B deferred two concrete items to it (completion %, closing odds).
-
-- **What to paste at start of either session:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md. For the infra session also bring `001_curated_static.sql` + `002_curated_events.sql`. For the Computed session also bring `CURATED_SCHEMA_REFERENCE.md`.
-- **ClickUp:** create the chosen session's task (Infra & DevOps space for the infrastructure option; Schema Design list for the Computed option).
+- **Goal:** apply the proven spine pattern to the next FK layer — `fixtures` — for EPL 2025.
+  1. Add an `--entity fixtures` step: `GET /fixtures?league=39&season=2025` → land raw → upsert `curated.fixtures` (natural key `(sport, source, source_ref)`), resolving `league_season_id`, `home_team_id`, `away_team_id`, `venue_id` via the resolution map / SELECT fallback. Full score breakdown (HT/FT/ET/PEN) nullable per D-067.
+  2. Run against EPL 2025 and verify counts (~380 fixtures for a completed season) + spot-check a few results against the standings already loaded.
+  3. Then plan `match_statistics` (per-fixture loop) as the following step — introduces the high-volume per-fixture cadence (Q-NEW-AK).
+- **Why next:** fixtures unlock everything downstream (stats, lineups, player stats, odds all hang off a fixture). Same proven pattern, one new FK layer.
+- **What to paste at session start:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md, `CURATED_SCHEMA_REFERENCE.md`, `SYNC_INGESTION_DESIGN.md`.
+- **ClickUp:** Session 7 task marked ✅ Complete; next task created in **Backend & Database → Sync Engine** — "Session 8 — Ingest fixtures for EPL 2025 (extend spine worker to `--entity fixtures`)".
 
 ---
 
@@ -405,9 +420,18 @@ Every artifact produced by this project, in order. Living index.
 | `SESSION_WORKFLOW.md` | 1 | How chat sessions work (user-facing reference) | Active |
 | `REQUIREMENTS.md` | 2 | Full functional spec (14 sections + executive summary). Authoritative for what the platform must do. **Paste at the start of Session 3+ alongside PROJECT_STATUS.md.** | Active |
 | `ARCHITECTURE.md` | 3 | High-level architecture (11 sections, Mermaid diagrams). Three-service Shape B topology on Railway, four data layers + Configuration Layer, six cross-cutting patterns, four resolved decisions. **Paste at the start of Session 4+ alongside PROJECT_STATUS.md, CRITICAL_RULES.md, and REQUIREMENTS.md.** | Active |
-| `001_curated_static.sql` | 4A | Curated Layer migration — static spine: `tiers` (seeded), `venues`, `leagues`, `league_seasons`, `league_tier_changes`, `teams`, `standings` | Active |
+| `001_curated_static.sql` | 4A | Curated static spine (design copy). Applied to hosted DB as `20260626120000_curated_static.sql` (D-070). | Applied (live) |
 | `CURATED_SCHEMA_REFERENCE.md` | 4A–4B | Plain-language Curated schema reference (v0.2 — conventions + static + event entities + decisions). | Active |
-| `002_curated_events.sql` | 4B | Curated Layer migration — event data: `fixtures`, `players`, `match_statistics`, `lineups`, `player_match_stats`, `odds_bookmakers`, `odds_markets`, `odds` | Active |
+| `002_curated_events.sql` | 4B | Curated event data (design copy). Applied to hosted DB as `20260626120100_curated_events.sql` (D-070). | Applied (live) |
+| `CLAUDE.md` | 5 | Repo-root instructions auto-read by Claude Code every session (stack, conventions, migration rules, guardrails). Lives in repo root. | Active |
+| `20260626120000_curated_static.sql` | 5 | Live migration (timestamped) in `supabase/migrations/`. | Applied (live) |
+| `20260626120100_curated_events.sql` | 5 | Live migration (timestamped) in `supabase/migrations/`. | Applied (live) |
+| `.gitignore` / `README.md` / `supabase/config.toml` | 5 | Repo scaffolding. `.gitignore` blocks secrets; `config.toml` holds only the project ref. | Active |
+| `INFRA_SETUP_RUNBOOK.md` | 5 | Beginner step-by-step for repo + Supabase setup (reference; not committed to repo). | Reference |
+| `SYNC_INGESTION_DESIGN.md` | 6 | Ingestion design (raw-first, FK-ordered chain, upsert/resolution, endpoint→table map, EPL-2025 slice spec). Committed to `docs/`. **Paste at implementation sessions.** | Active |
+| `20260704165243_create_raw_api_responses.sql` | 7 | Live migration — `raw` schema + `raw.api_responses` landing table (+ 2 indexes). | Applied (live) |
+| `backend/statesta_sync/` | 7 | Sync worker package: `config.py`, `api_football.py`, `db.py`, `smoke_test.py`, `raw_landing.py`, `upsert.py` (`upsert_returning_id` + `ResolutionMap` + `ADMIN_OWNED_COLUMNS` guardrail), `spine.py` (leagues/league_seasons/venues/teams/standings). Committed. | Active (proven) |
+| `backend/requirements.txt` / `backend/.env.example` | 7 | Deps (`psycopg[binary]`, `httpx`, `python-dotenv`) + secrets template (key names only, no values). | Active |
 
 ---
 
@@ -435,4 +459,4 @@ Quick reference for terms we'll use across many chats.
 
 ---
 
-*Last updated: 2026-06-26 (end of Session 4B — Curated Layer complete)*
+*Last updated: 2026-07-08 (end of Session 7 — EPL-2025 spine ingestion built, validated, and live)*
