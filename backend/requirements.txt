@@ -1,0 +1,5 @@
+# Statesta sync worker — runtime dependencies
+# Install into a local venv:  python -m venv .venv && .venv/Scripts/activate && pip install -r requirements.txt
+psycopg[binary]>=3.2      # PostgreSQL driver (psycopg v3); [binary] ships prebuilt libpq, no compiler needed
+httpx>=0.27               # HTTP client for API-Football calls
+python-dotenv>=1.0        # loads secrets from .env
