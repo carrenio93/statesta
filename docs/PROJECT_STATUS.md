@@ -247,6 +247,7 @@ This is the running list of features. **Fully formalized in REQUIREMENTS.md as o
 | 5 | 2026-07-04 | Infrastructure Setup — repo + Supabase + migrations applied | Private GitHub repo `carrenio93/statesta`; Supabase project (EU/Frankfurt); `CLAUDE.md`, `.gitignore`, `README.md`, `supabase/config.toml`; **Curated migrations applied to hosted DB** (15 tables live, tiers seeded) | ✅ Complete |
 | 6 | 2026-07-04 | Sync Workers — Ingestion Design | `SYNC_INGESTION_DESIGN.md` (raw-first model + minimal `raw.api_responses` landing table, FK-ordered sync chain, upsert/`source_ref→id` resolution, endpoint→table map, EPL-2025 vertical-slice spec) | ✅ Complete |
 | 7 | 2026-07-08 | Sync Workers — EPL-2025 Spine Implementation | Working sync worker (`backend/statesta_sync/`): config, API-Football client, psycopg v3 DB helper, smoke test, raw-landing, `upsert_returning_id` + `ResolutionMap`, spine worker (leagues → league_seasons → venues → teams → standings). `raw.api_responses` migration applied. **Validated end-to-end vs EPL 2025: 1/1/20/20/20, real PL table reproduced, idempotent re-run, admin-override protection proven.** | ✅ Complete |
+| 8 | 2026-07-09 | Sync Workers — EPL-2025 Fixtures Ingestion | `backend/statesta_sync/fixtures.py` (new) + `--entity fixtures` dispatch (lazy import) + `curated.fixtures` registered in the admin guardrail (empty set). First **event-data** worker; FK resolution via cross-run SELECT preload. **Validated vs EPL 2025: 380 fixtures, 0 unresolved venues, D-067 nullable score breakdown proven (headline/HT/FT populated on all 380, ET/PEN NULL on all 380), zero orphaned FKs, idempotent re-run (curated flat at 380, raw append-only). Learned API-Football `/fixtures` rejects an explicit `page` field → send `page` only when ≥ 2.** | ✅ Complete |
 | ... | TBD | (more added as we go) | | |
 
 ---
@@ -337,6 +338,9 @@ A running log of important decisions, with rationale.
 | D-078 | 2026-07-08 | **`standings.group_label` = NULL for single-table competitions;** only genuine group labels (e.g. World Cup "Group A") are stored. | API-Football echoes the competition name into `group` for single-table leagues; storing that is noise. NULL makes the column mean exactly one thing (NULL = no real grouping). Matches the schema comment. |
 | D-079 | 2026-07-08 | **Admin-owned columns are INSERT-only and must never appear in any `DO UPDATE` set** — enforced mechanically, not by convention. Registry `ADMIN_OWNED_COLUMNS` in the upsert helper raises if an admin column is in an update and refuses to run against an unregistered table. Columns: `tier_id`, `needs_review`, `suggested_tier_id`, `tier_is_admin_set`, `is_active`. | The single most important ingestion-safety behavior: a nightly re-sync must never wipe a human admin's decision (D-012, §4.2.4). Design doc hadn't spelled this out; Claude Code surfaced it. Proven against a non-default value (`tier_id='top'` survived a re-sync while `updated_at` advanced). |
 | D-080 | 2026-07-08 | **Commits go directly to `main`** for now (no feature-branch/PR flow). | Solo dev, sequential slices, no CI gate or collaborators to protect yet; matches existing history. **Revisit** the moment Stratos or anyone else commits, or CI review gates are added. |
+| D-081 | 2026-07-09 | **On `fixtures`, an absent or unresolved venue → `venue_id = NULL`; a venue is never created in the fixtures pass.** Unresolved count is logged, not hidden. | "Absent, not invented" (D-051), consistent with D-077: the `/fixtures` payload's job isn't venue creation, so manufacturing partial venue rows from it would blur ownership and smuggle assumptions in as truth. Venue creation stays owned by `/teams` (and a later `/venues` sync). Proven harmless in practice — the run resolved **0 of 380** as unresolved (every EPL venue was already loaded). |
+| D-082 | 2026-07-09 | **Pagination convention: send the `page` query param only for page ≥ 2.** API-Football defaults to page 1 and `/fixtures` *rejects* an explicit `page` field (returns HTTP 200 with an `errors` block). The worker's loop still reads `paging.total` and breaks correctly. | Universal, not a `/fixtures` special-case — the same rule is correct for the future paginated endpoints (`/players`, `/odds`). Side effect: page-1 raw rows record `request_params` without a `"page"` key, which still fully identifies the call. Surfaced by a real API error on the first run. |
+| D-083 | 2026-07-09 | **Shared worker helpers (`_fetch`, `_land`, `_dig`, `SyncError`, `SOURCE`/`SPORT`) will be extracted into a neutral `ingest_common.py` as the first task of Session 9.** The interim lazy-import in `spine.py` is accepted for Session 8. | `fixtures.py` imports helpers back from `spine.py`, so a plain module-level import created a circular-import that broke when fixtures loaded first. Lazy import is the minimal fix now; the extraction is the clean fix and is cheap while there's only one sibling worker — before `match_statistics`, `lineups`, `player_match_stats` each add another. |
 
 ---
 
@@ -376,35 +380,40 @@ Questions that need answering before relevant sessions can run.
 | Q-NEW-AH | Coaches — keep the soft `coach_name` + `coach_source_ref` on `lineups`, or promote coaches to a `curated.coaches` entity later? | Coach-related features (none in MVP) | Claude + User | Open — soft fields chosen for MVP (Session 4B) |
 | Q-NEW-AI | Odds capture cadence (how often the sync snapshots odds) + design of the post-kickoff job that resolves `computed.closing_odds` | Closing-odds accuracy; backtest quality | User (cadence) + Claude (job) | Open — operational / Computed-layer concern; raised in Session 4B |
 | Q-NEW-AJ | Raw granularity at scale — keep one-row-per-API-call, or add per-entity raw tables when incremental diffing is built? | Full Raw-layer session | Claude | Open — per-call chosen for MVP (Session 6); revisit when diffing/archival is designed |
-| Q-NEW-AK | Pagination + rate-limit/API-budget handling for high-volume endpoints (`/players`, `/odds`, per-fixture loops) | Sync worker implementation | Claude + User | Open — operational; addressed during implementation sessions |
+| Q-NEW-AK | Pagination + rate-limit/API-budget handling for high-volume endpoints (`/players`, `/odds`, per-fixture loops) | Sync worker implementation | Claude + User | ⚙️ Partially resolved Session 8 — **pagination convention** settled (D-082: send `page` only when ≥ 2; loop on `paging.total`). **Rate-limit / API-budget** half still open and becomes central in Session 9 (first per-fixture loop, ~380 calls for one league-season). |
 | Q-NEW-AL | EPL 2025 reports `cov_odds = false` — which league-seasons actually have odds coverage on API-Football, and how does that constrain D-023 (backtest needs real captured odds) and D-025 (historical odds backfill)? | Odds session; backtest viability | User + Claude | Open — surfaced in Session 7; check coverage before the odds work |
 | Q-NEW-AM | Our ingested data is validated against the vendor itself. Do we want an independent spot-check against a non-API-Football source (at least for launch leagues) before go-live? | Data-quality / launch confidence | User | Open — surfaced in Session 7; pre-launch data-quality task |
+| Q-NEW-AN | Raw landing and normalization currently share **one transaction per page**, so a normalization failure rolls back the raw audit row too — that payload then can't be replayed without re-calling the API. Do we split them (land-commit-then-normalize) for true replayability? | Full Raw-layer session (retry/replay semantics) | Claude | Open — surfaced in Session 8; not a regression (spine behaves the same). Revisit when archival/diffing is designed. |
+| Q-NEW-AO | Should event-data workers populate a `source_extra` catch-all for unmodelled vendor fields (the "capture every field" principle, D-066-style)? The fixtures worker currently does **not** — the column map was explicit. | Per-table, during each event-data worker | Claude + User | Open — surfaced in Session 8. Decide per table as we add `match_statistics`, `lineups`, `player_match_stats`. |
 
 ---
 
 ## 9. Current Active Task
 
-**Session 7: Sync Workers — EPL-2025 Spine Implementation** — ✅ COMPLETE → **first real data is live in the database**
+**Session 8: Sync Workers — EPL-2025 Fixtures Ingestion** — ✅ COMPLETE → **the first event-data layer is live**
 
-Built and validated the first sync worker end-to-end. Worker package under `backend/statesta_sync/` (config, API-Football client, psycopg v3 DB helper, smoke test, raw-landing with sha256, `upsert_returning_id` + `ResolutionMap`, spine worker). The `raw.api_responses` migration is applied. Data mapping decisions locked (D-075–D-078); the admin-owned-columns guardrail made mechanical (D-079); direct-to-main convention recorded (D-080).
+Extended the proven spine pattern to the first *event-data* FK layer. New worker `backend/statesta_sync/fixtures.py`, wired into the `--entity fixtures` dispatch (via a lazy import to avoid a circular import — D-083), with `curated.fixtures` registered in the admin guardrail (empty column set). FK resolution here uses the **cross-run SELECT fallback** (parents were written in a prior run): `league_season_id` resolved once, teams and venues preloaded into `{source_ref → id}` dicts. Decisions locked: venue absent-not-invented (D-081), pagination convention (D-082), the planned `ingest_common.py` extraction (D-083).
 
-**Validation (all Part-5 criteria met):** EPL (league 39), season 2025 → `curated` counts 1 league / 1 league_season / 20 venues / 20 teams / 20 standings; the standings reproduce the real 2025/26 Premier League ladder in order (Arsenal, 85 pts); re-run is idempotent (curated unchanged, `raw` grew append-only); and the admin-override protection was proven against a non-default value (`tier_id='top'` survived a re-sync).
+**Validation (all criteria met):** EPL (league 39), season 2025 → **380 fixtures**; spot-check resolves real matchups + full-time scores (Liverpool 4-2 Bournemouth, Man Utd 0-1 Arsenal opening weekend); **D-067 nullable score breakdown proven** — headline/HT/FT populated on all 380, ET/PEN NULL on all 380 (league play, so no extra time/penalties; NULL never 0); **zero orphaned FKs** (no null league_season/team/venue); **0 of 380 unresolved venues**; **idempotent re-run** (curated flat at 380, `raw` grew append-only). One real API quirk found and fixed mid-run: `/fixtures` rejects an explicit `page` field (D-082).
 
-**State of the schema:** Curated Layer = COMPLETE and APPLIED. Raw = minimal landing table live. **Ingestion pattern proven end-to-end** for the static spine and ready to scale. Not yet ingested: fixtures, players, match_statistics, lineups, player_match_stats, odds. Still not designed: full Raw layer, Computed, User, Configuration.
+*(Independent Supabase browser cross-check offered but deferred by user — optional, non-blocking.)*
 
-*(Prior: 6 — ingestion design ✅; 5 — Infrastructure ✅; 4B/4A — schema ✅; 3 — Architecture ✅.)*
+**State of the schema:** Curated Layer = COMPLETE and APPLIED. Raw = minimal landing table live. **Ingestion pattern now proven across two FK layers** (static spine + first event-data table) and a cross-run resolution path. Ingested so far: leagues, league_seasons, venues, teams, standings, **fixtures**. Not yet ingested: players, match_statistics, lineups, player_match_stats, odds. Still not designed: full Raw layer, Computed, User, Configuration.
+
+*(Prior: 7 — spine ingestion ✅; 6 — ingestion design ✅; 5 — Infrastructure ✅; 4B/4A — schema ✅; 3 — Architecture ✅.)*
 
 ---
 
-**Next session — Extend the worker to fixtures (Claude Code):**
+**Next session (9) — First per-fixture worker: `match_statistics` (Claude Code):**
 
-- **Goal:** apply the proven spine pattern to the next FK layer — `fixtures` — for EPL 2025.
-  1. Add an `--entity fixtures` step: `GET /fixtures?league=39&season=2025` → land raw → upsert `curated.fixtures` (natural key `(sport, source, source_ref)`), resolving `league_season_id`, `home_team_id`, `away_team_id`, `venue_id` via the resolution map / SELECT fallback. Full score breakdown (HT/FT/ET/PEN) nullable per D-067.
-  2. Run against EPL 2025 and verify counts (~380 fixtures for a completed season) + spot-check a few results against the standings already loaded.
-  3. Then plan `match_statistics` (per-fixture loop) as the following step — introduces the high-volume per-fixture cadence (Q-NEW-AK).
-- **Why next:** fixtures unlock everything downstream (stats, lineups, player stats, odds all hang off a fixture). Same proven pattern, one new FK layer.
+- **Goal:** ingest `curated.match_statistics` for EPL 2025 — the first worker that loops **per fixture**.
+  1. **First task (D-083):** extract the shared helpers (`_fetch`, `_land`, `_dig`, `SyncError`, `SOURCE`/`SPORT`) out of `spine.py` into a neutral `ingest_common.py`; update `spine.py` and `fixtures.py` imports; drop the lazy-import workaround. Small, mechanical, verify with a no-op import + `--help`.
+  2. Add an `--entity match_statistics` step: for each of the 380 fixtures, `GET /fixtures/statistics?fixture=<id>` → land raw → upsert `curated.match_statistics` (composite natural key `(fixture_id, team_id)`, D-057 — **two rows per fixture**). Full-fidelity stat set incl. xG / goals-prevented (D-066); unmodelled fields → `source_extra` (settles Q-NEW-AO for this table); all measures nullable (§6.7).
+  3. **This introduces the high-volume per-fixture cadence** — so this is where the rate-limit / API-budget half of **Q-NEW-AK** must be handled (throttle between calls, budget-meter, resumability so a mid-loop failure doesn't restart all 380). First check `cov_fixture_statistics` on the EPL-2025 league_season before looping.
+- **Why next:** `match_statistics` is the next FK layer down (depends on fixtures + teams) and directly feeds the filter engine (shots, corners, cards, possession). It's the first per-fixture loop, so it's where budget discipline first bites — better to establish it on one league than at scale.
+- **Scope caution (Rule 2):** if the `ingest_common.py` refactor + the per-fixture worker + budget handling feels like more than one clean deliverable during the session, split — do the refactor and worker, defer a full budget/resumability treatment to its own step.
 - **What to paste at session start:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md, `CURATED_SCHEMA_REFERENCE.md`, `SYNC_INGESTION_DESIGN.md`.
-- **ClickUp:** Session 7 task marked ✅ Complete; next task created in **Backend & Database → Sync Engine** — "Session 8 — Ingest fixtures for EPL 2025 (extend spine worker to `--entity fixtures`)".
+- **ClickUp:** Session 8 task marked ✅ Complete; next task created in **Backend & Database → Sync Engine** — "Session 9 — Ingest match_statistics for EPL 2025 (first per-fixture worker; extract `ingest_common.py` first)".
 
 ---
 
@@ -432,6 +441,8 @@ Every artifact produced by this project, in order. Living index.
 | `20260704165243_create_raw_api_responses.sql` | 7 | Live migration — `raw` schema + `raw.api_responses` landing table (+ 2 indexes). | Applied (live) |
 | `backend/statesta_sync/` | 7 | Sync worker package: `config.py`, `api_football.py`, `db.py`, `smoke_test.py`, `raw_landing.py`, `upsert.py` (`upsert_returning_id` + `ResolutionMap` + `ADMIN_OWNED_COLUMNS` guardrail), `spine.py` (leagues/league_seasons/venues/teams/standings). Committed. | Active (proven) |
 | `backend/requirements.txt` / `backend/.env.example` | 7 | Deps (`psycopg[binary]`, `httpx`, `python-dotenv`) + secrets template (key names only, no values). | Active |
+| `backend/statesta_sync/fixtures.py` | 8 | First event-data worker: `/fixtures` → `curated.fixtures`. Raw-first, pagination loop (D-082), cross-run SELECT FK resolution, venue absent-not-invented (D-081), full nullable score breakdown (D-067). Committed. | Active (proven) |
+| `backend/statesta_sync/spine.py` / `upsert.py` | 8 (updated) | `spine.py`: added `--entity fixtures` dispatch (lazy import, interim per D-083). `upsert.py`: registered `curated.fixtures` in `ADMIN_OWNED_COLUMNS` (empty set). | Active |
 
 ---
 
@@ -459,4 +470,4 @@ Quick reference for terms we'll use across many chats.
 
 ---
 
-*Last updated: 2026-07-08 (end of Session 7 — EPL-2025 spine ingestion built, validated, and live)*
+*Last updated: 2026-07-09 (end of Session 8 — EPL-2025 fixtures ingested, validated, and live; 380 fixtures)*

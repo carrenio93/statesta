@@ -12,6 +12,7 @@ Run one entity at a time:
     python -m statesta_sync.spine --entity leagues
     python -m statesta_sync.spine --entity teams
     python -m statesta_sync.spine --entity standings
+    python -m statesta_sync.spine --entity fixtures   # event data (see fixtures.py)
 
 There is no default entity: nothing writes unless you name it.
 """
@@ -479,10 +480,26 @@ ENTITIES = {
     "standings": sync_standings,
 }
 
+# Event-data workers live in their own modules (fixtures, later players/odds/...)
+# and import shared helpers back from this one. To keep a single import direction
+# (worker -> spine) and avoid an import cycle, they are resolved lazily here.
+LAZY_ENTITIES = frozenset({"fixtures"})
+
+
+def _entity_fn(name: str):
+    """Return the worker fn for an --entity, importing lazily where needed."""
+    if name == "fixtures":
+        from .fixtures import ingest_fixtures
+
+        return ingest_fixtures
+    return ENTITIES[name]
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Statesta static-spine sync worker")
-    parser.add_argument("--entity", required=True, choices=sorted(ENTITIES))
+    parser.add_argument(
+        "--entity", required=True, choices=sorted(set(ENTITIES) | LAZY_ENTITIES)
+    )
     parser.add_argument("--league", type=int, default=DEFAULT_LEAGUE)
     parser.add_argument("--season", type=int, default=DEFAULT_SEASON)
     parser.add_argument("--show-sql", action="store_true", help="print every statement issued")
@@ -493,7 +510,7 @@ def main() -> int:
 
     with connect(config.database_url) as conn, ApiFootballClient(config.api_football_key) as api:
         try:
-            result = ENTITIES[args.entity](conn, api, resolver, args.league, args.season)
+            result = _entity_fn(args.entity)(conn, api, resolver, args.league, args.season)
         except SyncError as exc:
             print(f"SYNC FAILED — {exc}")
             return 1

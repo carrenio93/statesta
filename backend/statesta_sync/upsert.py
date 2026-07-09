@@ -49,6 +49,7 @@ ADMIN_OWNED_COLUMNS: dict[str, frozenset[str]] = {
     "curated.venues": frozenset(),
     "curated.teams": frozenset(),
     "curated.standings": frozenset(),
+    "curated.fixtures": frozenset(),
 }
 
 
