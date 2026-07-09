@@ -29,10 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-# Shared helpers live in spine.py; reuse them rather than duplicating (imported
-# from spine, which in turn imports ingest_fixtures below its own definitions so
-# the cycle resolves cleanly).
-from .spine import SOURCE, SPORT, SyncError, _dig, _fetch, _land
+from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
 from .upsert import ResolutionMap, upsert_returning_id
 
 

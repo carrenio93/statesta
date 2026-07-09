@@ -22,40 +22,26 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date
-from typing import Any, NamedTuple
+from typing import Any
 
 from psycopg.types.json import Jsonb
 
 from .api_football import ApiFootballClient
 from .config import load_config
 from .db import connect
-from .raw_landing import land_raw, read_raw, utcnow
+from .fixtures import ingest_fixtures
+from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
 from .upsert import ISSUED, ResolutionMap, upsert_returning_id
 
-SPORT = "football"
-SOURCE = "api_football"
 UNMAPPED_TIER = "?"  # D-012: newly discovered leagues land unmapped, awaiting review
 
 DEFAULT_LEAGUE = 39  # API-Football: Premier League
 DEFAULT_SEASON = 2025
 
 
-class SyncError(RuntimeError):
-    """The API call failed, or returned something we refuse to normalize."""
-
-
 # ---------------------------------------------------------------------------
 # small mapping helpers — absent stays NULL, never 0 / false (D-051, §6.7)
 # ---------------------------------------------------------------------------
-
-
-def _dig(obj: Any, *path: str) -> Any:
-    """Nested .get() that tolerates missing/None levels and returns None."""
-    for key in path:
-        if not isinstance(obj, dict):
-            return None
-        obj = obj.get(key)
-    return obj
 
 
 def _as_date(value: Any) -> date | None:
@@ -74,62 +60,6 @@ def _extra(obj: dict, mapped_keys: set[str]) -> Jsonb | None:
     """
     leftover = {k: v for k, v in obj.items() if k not in mapped_keys}
     return Jsonb(leftover) if leftover else None
-
-
-def _api_ok(status: int, body: Any) -> bool:
-    return status == 200 and isinstance(body, dict) and not body.get("errors")
-
-
-class _Fetched(NamedTuple):
-    """A validated API response, not yet landed."""
-
-    endpoint: str
-    params: dict
-    http_status: int
-    body: Any
-    fetched_at: Any
-
-
-def _fetch(conn, api: ApiFootballClient, endpoint: str, params: dict) -> _Fetched:
-    """Call the API and validate the response.
-
-    On failure the raw row is committed in its own transaction (so the failure
-    stays auditable via http_status) and we raise. Failures never reach curated.
-    On success nothing is written yet — the caller lands it inside the entity's
-    transaction, so the raw row and the curated rows commit together.
-    """
-    fetched_at = utcnow()
-    status, body = api.get(endpoint, params)
-
-    if not _api_ok(status, body):
-        with conn.transaction():
-            with conn.cursor() as cur:
-                land_raw(cur, endpoint, params, status, body, fetched_at)
-        errors = body.get("errors") if isinstance(body, dict) else None
-        raise SyncError(
-            f"{endpoint} {params}: HTTP {status}"
-            + (f", errors={errors!r}" if errors else "")
-            + " (raw row landed for audit; nothing written to curated)"
-        )
-
-    return _Fetched(endpoint, params, status, body, fetched_at)
-
-
-def _land(cur, fetched: _Fetched) -> tuple[Any, Any]:
-    """Land the validated payload, then read it back. Returns (payload, source_fetched_at).
-
-    D-071: everything downstream normalizes from the value returned here — the
-    landed row — never from the live HTTP response.
-    """
-    raw_id = land_raw(
-        cur,
-        fetched.endpoint,
-        fetched.params,
-        fetched.http_status,
-        fetched.body,
-        fetched.fetched_at,
-    )
-    return read_raw(cur, raw_id)
 
 
 # ---------------------------------------------------------------------------
@@ -474,32 +404,20 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
 # entrypoint
 # ---------------------------------------------------------------------------
 
+# Event-data workers live in their own modules (fixtures, later players/odds/...).
+# Both they and the spine draw their shared helpers from ingest_common, so nothing
+# imports back into this module and they can be dispatched like any other entity.
 ENTITIES = {
     "leagues": sync_leagues,
     "teams": sync_teams,
     "standings": sync_standings,
+    "fixtures": ingest_fixtures,
 }
-
-# Event-data workers live in their own modules (fixtures, later players/odds/...)
-# and import shared helpers back from this one. To keep a single import direction
-# (worker -> spine) and avoid an import cycle, they are resolved lazily here.
-LAZY_ENTITIES = frozenset({"fixtures"})
-
-
-def _entity_fn(name: str):
-    """Return the worker fn for an --entity, importing lazily where needed."""
-    if name == "fixtures":
-        from .fixtures import ingest_fixtures
-
-        return ingest_fixtures
-    return ENTITIES[name]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Statesta static-spine sync worker")
-    parser.add_argument(
-        "--entity", required=True, choices=sorted(set(ENTITIES) | LAZY_ENTITIES)
-    )
+    parser.add_argument("--entity", required=True, choices=sorted(ENTITIES))
     parser.add_argument("--league", type=int, default=DEFAULT_LEAGUE)
     parser.add_argument("--season", type=int, default=DEFAULT_SEASON)
     parser.add_argument("--show-sql", action="store_true", help="print every statement issued")
@@ -510,7 +428,7 @@ def main() -> int:
 
     with connect(config.database_url) as conn, ApiFootballClient(config.api_football_key) as api:
         try:
-            result = _entity_fn(args.entity)(conn, api, resolver, args.league, args.season)
+            result = ENTITIES[args.entity](conn, api, resolver, args.league, args.season)
         except SyncError as exc:
             print(f"SYNC FAILED — {exc}")
             return 1
