@@ -1,0 +1,9 @@
+# Normalize text files to LF in the repo AND force LF in the working tree on
+# every platform (Windows included) so on-disk bytes are identical everywhere.
+* text=auto eol=lf
+
+# Explicitly treat known binaries as binary (never touch their bytes)
+*.pyc binary
+*.png binary
+*.jpg binary
+*.ico binary
