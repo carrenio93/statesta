@@ -13,6 +13,7 @@ Run one entity at a time:
     python -m statesta_sync.spine --entity teams
     python -m statesta_sync.spine --entity standings
     python -m statesta_sync.spine --entity fixtures   # event data (see fixtures.py)
+    python -m statesta_sync.spine --entity match_statistics --limit 1  # per-fixture loop
 
 There is no default entity: nothing writes unless you name it.
 """
@@ -31,6 +32,7 @@ from .config import load_config
 from .db import connect
 from .fixtures import ingest_fixtures
 from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
+from .match_statistics import ingest_match_statistics
 from .upsert import ISSUED, ResolutionMap, upsert_returning_id
 
 UNMAPPED_TIER = "?"  # D-012: newly discovered leagues land unmapped, awaiting review
@@ -412,7 +414,13 @@ ENTITIES = {
     "teams": sync_teams,
     "standings": sync_standings,
     "fixtures": ingest_fixtures,
+    "match_statistics": ingest_match_statistics,
 }
+
+# Workers that loop over fixtures (one API call each) rather than making a single
+# call. Only these accept --limit / --sleep; passing them elsewhere is a TypeError,
+# so the set is named explicitly instead of inferred.
+LOOP_ENTITIES = frozenset({"match_statistics"})
 
 
 def main() -> int:
@@ -421,14 +429,31 @@ def main() -> int:
     parser.add_argument("--league", type=int, default=DEFAULT_LEAGUE)
     parser.add_argument("--season", type=int, default=DEFAULT_SEASON)
     parser.add_argument("--show-sql", action="store_true", help="print every statement issued")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=f"process at most N fixtures, then stop ({', '.join(sorted(LOOP_ENTITIES))} only)",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.5,
+        help=f"seconds to sleep between API calls ({', '.join(sorted(LOOP_ENTITIES))} only)",
+    )
     args = parser.parse_args()
 
     config = load_config()
     resolver = ResolutionMap()
 
+    # --limit/--sleep are keyword-only options of the fixture-looping workers.
+    options = {"limit": args.limit, "sleep": args.sleep} if args.entity in LOOP_ENTITIES else {}
+
     with connect(config.database_url) as conn, ApiFootballClient(config.api_football_key) as api:
         try:
-            result = ENTITIES[args.entity](conn, api, resolver, args.league, args.season)
+            result = ENTITIES[args.entity](
+                conn, api, resolver, args.league, args.season, **options
+            )
         except SyncError as exc:
             print(f"SYNC FAILED — {exc}")
             return 1

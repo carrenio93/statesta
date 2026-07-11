@@ -30,6 +30,9 @@ class ApiFootballClient:
             headers={"x-apisports-key": api_key},
             timeout=timeout,
         )
+        # Response headers of the most recent call. Carries the rate-limit budget
+        # (x-ratelimit-requests-remaining), which callers log. None until first get().
+        self.last_headers: Optional[httpx.Headers] = None
 
     def get(
         self, endpoint: str, params: Optional[dict[str, Any]] = None
@@ -38,8 +41,10 @@ class ApiFootballClient:
 
         `endpoint` is a path like "/status" or "/leagues".
         Returns the parsed JSON body, or None if the body was not valid JSON.
+        Side effect: `self.last_headers` is updated with this response's headers.
         """
         response = self._client.get(endpoint, params=params or {})
+        self.last_headers = response.headers
         try:
             body = response.json()
         except ValueError:
