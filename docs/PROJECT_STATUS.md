@@ -173,6 +173,8 @@ The v2.7 prototype (originally built under the name ScoutEngine) is a working lo
 - **This chat (Claude Opus, project-scoped):** Architect. Designs, plans, documents. Doesn't write production code directly.
 - **Claude Code (terminal):** Engineer. Implements specs from this chat, edits files, runs tests, opens commits.
 - **ClickUp:** Source of truth for task tracking. Every major task = one ClickUp item.
+  - **Access note (for Claude):** ClickUp is often connected to this chat as an MCP tool — **check available tools before assuming either way** (do not claim you lack access without checking; do not assume you have it). If the ClickUp tools are present, update tasks directly. If they are *not* connected in a given session, hand the user ready-to-paste prompts for Claude Code (which has the ClickUp integration on the local side). Tool access is set per-chat and does not carry across sessions.
+  - **Sync Engine list ID:** `901217784130`. Session tasks: `status: "backlog"` on creation, `status: "done"` on completion. `clickup_filter_tasks` needs `include_closed: true` to surface completed tasks.
 - **GitHub:** Source of truth for code (when it exists).
 - **PROJECT_STATUS.md (this file):** Source of truth for decisions and current state across all chats.
 
@@ -422,7 +424,7 @@ Two deliverables. **(1)** Executed the D-083 extraction: shared helpers moved in
 - **Alternative if preferred (product call):** `lineups` via `/fixtures/lineups` (simpler, single table, but *also* needs players to exist first) — so `/fixtures/players` really does come first either way. Or defer per-fixture workers and extend `match_statistics` to a **second league** to exercise the Q-NEW-AO "EPL-only" caveat. Recommend the `/fixtures/players` worker.
 - **Scope caution (Rule 2):** seeding a new entity (`players`) *and* a per-fixture stat table in one session is more moving parts than Session 9. If it feels like two deliverables, split: session 10 = players seeding + `player_match_stats`; keep it to one league (EPL 2025).
 - **What to paste at session start:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md, `CURATED_SCHEMA_REFERENCE.md`, `SYNC_INGESTION_DESIGN.md`.
-- **ClickUp:** Session 9 task → mark ✅ Complete; create next task in **Backend & Database → Sync Engine** — "Session 10 — Ingest players + player_match_stats for EPL 2025 (`/fixtures/players`; seeds the players entity)".
+- **ClickUp (already done this session):** Session 9 task (`869e28z0d`) marked ✅ done; **Session 10 task already created** in Sync Engine (list `901217784130`) — `869e3awwx`, status backlog: "Session 10 — Ingest players + player_match_stats for EPL 2025 (`/fixtures/players`; seeds the players entity)". **Do not create a duplicate** — this task already exists; just mark it done at Session 10 close.
 
 ---
 
