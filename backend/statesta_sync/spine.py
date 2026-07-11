@@ -33,6 +33,7 @@ from .db import connect
 from .fixtures import ingest_fixtures
 from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
 from .match_statistics import ingest_match_statistics
+from .player_match_stats import ingest_player_match_stats
 from .upsert import ISSUED, ResolutionMap, upsert_returning_id
 
 UNMAPPED_TIER = "?"  # D-012: newly discovered leagues land unmapped, awaiting review
@@ -415,12 +416,13 @@ ENTITIES = {
     "standings": sync_standings,
     "fixtures": ingest_fixtures,
     "match_statistics": ingest_match_statistics,
+    "player_match_stats": ingest_player_match_stats,
 }
 
 # Workers that loop over fixtures (one API call each) rather than making a single
 # call. Only these accept --limit / --sleep; passing them elsewhere is a TypeError,
 # so the set is named explicitly instead of inferred.
-LOOP_ENTITIES = frozenset({"match_statistics"})
+LOOP_ENTITIES = frozenset({"match_statistics", "player_match_stats"})
 
 
 def main() -> int:
