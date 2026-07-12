@@ -14,6 +14,7 @@ Run one entity at a time:
     python -m statesta_sync.spine --entity standings
     python -m statesta_sync.spine --entity fixtures   # event data (see fixtures.py)
     python -m statesta_sync.spine --entity match_statistics --limit 1  # per-fixture loop
+    python -m statesta_sync.spine --entity lineups --limit 1           # per-fixture loop
 
 There is no default entity: nothing writes unless you name it.
 """
@@ -32,6 +33,7 @@ from .config import load_config
 from .db import connect
 from .fixtures import ingest_fixtures
 from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
+from .lineups import ingest_lineups
 from .match_statistics import ingest_match_statistics
 from .player_match_stats import ingest_player_match_stats
 from .upsert import ISSUED, ResolutionMap, upsert_returning_id
@@ -417,12 +419,13 @@ ENTITIES = {
     "fixtures": ingest_fixtures,
     "match_statistics": ingest_match_statistics,
     "player_match_stats": ingest_player_match_stats,
+    "lineups": ingest_lineups,
 }
 
 # Workers that loop over fixtures (one API call each) rather than making a single
 # call. Only these accept --limit / --sleep; passing them elsewhere is a TypeError,
 # so the set is named explicitly instead of inferred.
-LOOP_ENTITIES = frozenset({"match_statistics", "player_match_stats"})
+LOOP_ENTITIES = frozenset({"match_statistics", "player_match_stats", "lineups"})
 
 
 def main() -> int:
