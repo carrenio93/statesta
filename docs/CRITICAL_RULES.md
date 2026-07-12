@@ -65,7 +65,8 @@ Before the session ends, do all of these. No exceptions:
 6. Produce the updated PROJECT_STATUS.md as a downloadable file.
 7. Produce all session artifacts as files.
 8. **Show the user what changed in PROJECT_STATUS.md** — explicit list: "Section 6: added Session N row. Section 7: added D-0XX. Section 9: updated active task to Session N+1." This lets the user verify nothing was missed.
-9. Tell the user explicitly: which files to save, which ClickUp task to update, what to paste at the start of the next session.
+9. **Update ClickUp yourself — directly, without being asked.** ClickUp is a living project record; keeping it current is YOUR job, not the user's. When the ClickUp MCP tools are connected (check at session start), you: mark this session's task `done`; create the next session's task in the Sync Engine list (`901217784130`) with `backlog` status + a full description; record the new task id in PROJECT_STATUS.md Section 9. Only if the tools are genuinely absent do you fall back to a paste-prompt for Claude Code. **Never end a session having updated PROJECT_STATUS.md but not ClickUp — the two must always agree.** The user should never have to remind you.
+10. Tell the user explicitly: which files to save, what to paste at the start of the next session, and confirm what you already did in ClickUp.
 
 If you skip any of these, the user loses context permanently.
 
