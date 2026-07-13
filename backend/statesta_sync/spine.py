@@ -15,6 +15,7 @@ Run one entity at a time:
     python -m statesta_sync.spine --entity fixtures   # event data (see fixtures.py)
     python -m statesta_sync.spine --entity match_statistics --limit 1  # per-fixture loop
     python -m statesta_sync.spine --entity lineups --limit 1           # per-fixture loop
+    python -m statesta_sync.spine --entity player_bio --limit 1        # per-PAGE loop
 
 There is no default entity: nothing writes unless you name it.
 """
@@ -35,6 +36,7 @@ from .fixtures import ingest_fixtures
 from .ingest_common import SOURCE, SPORT, SyncError, _dig, _fetch, _land
 from .lineups import ingest_lineups
 from .match_statistics import ingest_match_statistics
+from .player_bio import ingest_player_bio
 from .player_match_stats import ingest_player_match_stats
 from .upsert import ISSUED, ResolutionMap, upsert_returning_id
 
@@ -420,12 +422,19 @@ ENTITIES = {
     "match_statistics": ingest_match_statistics,
     "player_match_stats": ingest_player_match_stats,
     "lineups": ingest_lineups,
+    "player_bio": ingest_player_bio,
 }
 
-# Workers that loop over fixtures (one API call each) rather than making a single
-# call. Only these accept --limit / --sleep; passing them elsewhere is a TypeError,
-# so the set is named explicitly instead of inferred.
-LOOP_ENTITIES = frozenset({"match_statistics", "player_match_stats", "lineups"})
+# Workers that make one API call per unit of work rather than a single call for the
+# whole entity. Only these accept --limit / --sleep; passing them elsewhere is a
+# TypeError, so the set is named explicitly instead of inferred.
+#
+# The unit of work is a FIXTURE for every worker here except player_bio, whose unit
+# is a PAGE of the league-season roster — so --limit 1 means one fixture for the
+# former and one page (~20 players) for the latter.
+LOOP_ENTITIES = frozenset(
+    {"match_statistics", "player_match_stats", "lineups", "player_bio"}
+)
 
 
 def main() -> int:
@@ -438,7 +447,8 @@ def main() -> int:
         "--limit",
         type=int,
         default=None,
-        help=f"process at most N fixtures, then stop ({', '.join(sorted(LOOP_ENTITIES))} only)",
+        help="process at most N units of work, then stop — fixtures for "
+        "match_statistics/player_match_stats/lineups, PAGES for player_bio",
     )
     parser.add_argument(
         "--sleep",
