@@ -333,9 +333,9 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
                 raise SyncError(f"{endpoint} {params}: empty response[]")
 
             groups = _dig(entries[0], "league", "standings") or []
-            single_group = len(groups) == 1  # single-table comp -> group_label NULL
 
             written = 0
+            landed_ids: set[int] = set()
             for group in groups:
                 for srow in group:
                     vendor_team_id = _dig(srow, "team", "id")
@@ -347,7 +347,7 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
                         )
 
                     update_ts = srow.get("update")
-                    upsert_returning_id(
+                    row_id = upsert_returning_id(
                         cur,
                         "curated.standings",
                         values={
@@ -356,7 +356,7 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
                             "source_fetched_at": fetched_at,
                             "league_season_id": league_season_id,
                             "team_id": our_team_id,
-                            "group_label": None if single_group else srow.get("group"),
+                            "group_label": srow.get("group"),
                             "rank": srow.get("rank"),
                             "points": srow.get("points"),
                             "goals_diff": srow.get("goalsDiff"),
@@ -383,10 +383,9 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
                             "away_goals_against": _dig(srow, "away", "goals", "against"),
                             "source_extra": Jsonb({"update": update_ts}) if update_ts else None,
                         },
-                        conflict_columns=["league_season_id", "team_id"],
+                        conflict_columns=["league_season_id", "team_id", "group_label"],
                         update_columns=[
                             "source_fetched_at",
-                            "group_label",
                             "rank",
                             "points",
                             "goals_diff",
@@ -402,9 +401,23 @@ def sync_standings(conn, api, resolver: ResolutionMap, league: int, season: int)
                             "source_extra",
                         ],
                     )
+                    landed_ids.add(row_id)
                     written += 1
 
-    return {"standings": written, "groups": len(groups)}
+            if written > len(landed_ids):
+                collapsed = written - len(landed_ids)
+                print(
+                    f"WARNING  standings collapse: {written} upsert attempts but only "
+                    f"{len(landed_ids)} distinct (league_season_id, team_id, group_label) "
+                    f"keys landed for league={league} season={season} — "
+                    f"{collapsed} row(s) would have overwritten a sibling"
+                )
+
+    return {
+        "standings": len(landed_ids),
+        "attempts": written,
+        "groups": len(groups),
+    }
 
 
 # ---------------------------------------------------------------------------
