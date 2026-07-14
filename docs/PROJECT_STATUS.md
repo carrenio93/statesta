@@ -450,7 +450,7 @@ S14 was scoped (Rule 2) to hardening only; the Greek ingest was consciously carr
 - **Alternatives (product call — pivot at the ritual):** Odds worker (`/odds`, gated on Q-NEW-AL); `/players` fill-gaps for the 39-row residual (Q-NEW-AT); assign tiers to *both* leagues (Q-NEW-AX, admin/product); promote the replay harness (Q-NEW-AY).
 - **Scope caution (Rule 2):** one deliverable — the Greek ingest + coverage characterisation. Don't drift into odds, fill-gaps, or tiering.
 - **What to paste at session start:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md, `CURATED_SCHEMA_REFERENCE.md`, `SYNC_INGESTION_DESIGN.md`.
-- **ClickUp:** mark `869e48mc6` (S14) done; create the S15 Greek-ingest task in the Sync Engine list (`901217784130`), backlog, linked to `869e48mc6`; record its id here.
+- **ClickUp:** mark `869e48mc6` (S14) done; create the S15 Greek-ingest task in the Sync Engine list (`901217784130`), backlog, linked to `869e48mc6`. **✅ Done — S15 task is `869e4t4tz`** ("Session 15 — Greek Super League (197/2025) cross-league ingest + coverage characterisation"). Mark it `in progress` at the S15 ritual.
 
 **Standing reminder — push state:** end-of-S14 all work is committed and pushed as **`b6cc7f4`** (five hardened workers + the S14 doc updates land in a second commit this session). `origin/main` == local `main`; working tree clean after that commit. Update this line to the new tip after the doc-update push.
 
