@@ -396,6 +396,7 @@ def ingest_player_match_stats(
     )
 
     written = 0            # player_match_stats rows written
+    dupes = 0              # duplicate player entries skipped (kept first occurrence)
     players_upserted = 0   # curated.players thin-seed upserts (incl. re-seeds)
     skipped_existing = 0
     no_stats: list[str] = []
@@ -450,6 +451,16 @@ def ingest_player_match_stats(
                         continue
 
                     fixture_rows = 0
+                    # Deduped on the vendor player ref, which IS the natural key of the
+                    # seed's conflict target (sport, source, source_ref) — so it maps 1:1
+                    # to our_player_id, the discriminator of the stat table's
+                    # (fixture_id, player_id) key. Gating here, BEFORE the seed, means a
+                    # repeated player costs neither a re-seed nor a stat upsert that the
+                    # next one would overwrite. ~40 rows/fixture: a duplicate is a REPEAT,
+                    # not missing data (unlike match_statistics), so the fixture still
+                    # lands in full — first occurrence wins.
+                    seen_refs: set[str] = set()
+                    fixture_dupes = 0
                     for block in blocks:
                         # team_id is NOT NULL / ON DELETE RESTRICT: an unresolved
                         # team RAISES and rolls the whole fixture back — we never
@@ -474,6 +485,12 @@ def ingest_player_match_stats(
                                     f"(fixture={source_ref}, team={team_ref})"
                                 )
 
+                            player_ref = str(player["id"])
+                            if player_ref in seen_refs:
+                                fixture_dupes += 1
+                                continue
+                            seen_refs.add(player_ref)
+
                             our_player_id = _upsert_player_seed(cur, player, fetched_at)
                             players_upserted += 1
 
@@ -493,6 +510,14 @@ def ingest_player_match_stats(
                             fixture_rows += 1
 
                     written += fixture_rows
+
+                    if fixture_dupes:
+                        dupes += fixture_dupes
+                        print(
+                            f"  WARNING  player_match_stats: fixture={source_ref} had "
+                            f"{fixture_dupes} duplicate player entry/entries — kept first "
+                            f"occurrence, {fixture_rows} distinct player(s) landed"
+                        )
 
             print(
                 f"  [{processed}] fixture={source_ref} -> {fixture_rows} player row(s)  "
@@ -528,6 +553,7 @@ def ingest_player_match_stats(
 
     return {
         "written": written,
+        "dupes": dupes,
         "players_upserted": players_upserted,
         "skipped_existing": skipped_existing,
         "no_stats": len(no_stats),

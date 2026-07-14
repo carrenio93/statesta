@@ -128,7 +128,11 @@ def ingest_fixtures(conn, api, resolver: ResolutionMap, league: int, season: int
     # --- paginate: land raw FIRST per page, then normalize from the landed payload
     page = 1
     total_pages = 1
-    fixtures_written = 0
+    # LANDED (distinct ids) vs attempts, same mechanism as standings (D-101). A repeated
+    # fixture in one response would report once instead of inflating the count. Returning
+    # attempts alongside keeps any collapse legible in the ordinary OK line.
+    fixture_ids_landed: set[int] = set()
+    fixtures_written = 0   # attempts (one per upsert call)
     unresolved_venues = 0
 
     while True:
@@ -180,7 +184,7 @@ def ingest_fixtures(conn, api, resolver: ResolutionMap, league: int, season: int
                     if venue_id is None:
                         unresolved_venues += 1
 
-                    upsert_returning_id(
+                    our_fixture_id = upsert_returning_id(
                         cur,
                         "curated.fixtures",
                         values={
@@ -214,6 +218,7 @@ def ingest_fixtures(conn, api, resolver: ResolutionMap, league: int, season: int
                         conflict_columns=["sport", "source", "source_ref"],
                         update_columns=_FIXTURE_UPDATE_COLUMNS,
                     )
+                    fixture_ids_landed.add(our_fixture_id)
                     fixtures_written += 1
 
         current = paging.get("current") or page
@@ -228,7 +233,8 @@ def ingest_fixtures(conn, api, resolver: ResolutionMap, league: int, season: int
     )
 
     return {
-        "fixtures": fixtures_written,
+        "fixtures": len(fixture_ids_landed),
+        "attempts": fixtures_written,
         "pages": total_pages,
         "unresolved_venues": unresolved_venues,
     }

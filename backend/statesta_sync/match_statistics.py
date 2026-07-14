@@ -340,8 +340,10 @@ def ingest_match_statistics(
     )
 
     written = 0
+    collisions = 0
     skipped_existing = 0
     no_stats: list[str] = []
+    dup_fixtures: list[str] = []
     failed: list[tuple[str, str]] = []
     unmapped_seen: set[str] = set()
     processed = 0
@@ -385,7 +387,15 @@ def ingest_match_statistics(
                     elif len(blocks) < 2:
                         reason = f"only {len(blocks)} team block(s)"
 
-                    rows = []
+                    # Keyed on team_id — the discriminator of the (fixture_id, team_id)
+                    # conflict key inside one fixture. Two blocks for the same team would
+                    # upsert the same row twice, the second silently overwriting the first:
+                    # a list would report 2 rows where 1 landed. That is the standings
+                    # collapse (D-100/D-101). This is a 2-row entity, so a same-team
+                    # duplicate means a team is probably MISSING — write nothing rather
+                    # than a half-populated fixture (see the dup_reason branch below).
+                    rows: dict[int, dict] = {}
+                    dup_reason = None
                     if reason is None:
                         for block in blocks:
                             team_ref = _dig(block, "team", "id")
@@ -396,11 +406,12 @@ def ingest_match_statistics(
                             if our_team_id is None:
                                 reason = f"team source_ref={team_ref} not in curated.teams"
                                 break
-                            rows.append(
-                                _build_row(
-                                    block, our_fixture_id, our_team_id,
-                                    fetched_at, unmapped_seen,
-                                )
+                            if our_team_id in rows:
+                                dup_reason = f"duplicate team block for team_ref={team_ref}"
+                                break
+                            rows[our_team_id] = _build_row(
+                                block, our_fixture_id, our_team_id,
+                                fetched_at, unmapped_seen,
                             )
 
                     if reason is not None:
@@ -410,7 +421,22 @@ def ingest_match_statistics(
                         print(f"  NO STATS fixture={source_ref} ({reason}) -> 0 rows")
                         continue
 
-                    for values in rows:
+                    if dup_reason is not None:
+                        # Distinct from no_stats: the payload HAD stats, but its team
+                        # identity is unusable. Writing the one good block would land a
+                        # half-fixture that the skip-set ("has any row") would then call
+                        # complete, silently losing the other team forever. Write 0 rows:
+                        # the fixture stays out of the skip-set and is retried next run.
+                        collisions += 1
+                        dup_fixtures.append(str(source_ref))
+                        print(
+                            f"  WARNING  match_statistics collapse: fixture={source_ref} — "
+                            f"{dup_reason}; refusing to write a half-populated fixture "
+                            "(0 rows written), will retry next run"
+                        )
+                        continue
+
+                    for values in rows.values():
                         upsert_returning_id(
                             cur,
                             "curated.match_statistics",
@@ -418,10 +444,11 @@ def ingest_match_statistics(
                             conflict_columns=["fixture_id", "team_id"],
                             update_columns=_UPDATE_COLUMNS,
                         )
-                    written += len(rows)
+                    fixture_rows = len(rows)
+                    written += fixture_rows
 
             print(
-                f"  [{processed}] fixture={source_ref} -> {len(rows)} row(s)  "
+                f"  [{processed}] fixture={source_ref} -> {fixture_rows} row(s)  "
                 f"remaining={remaining}"
             )
 
@@ -451,6 +478,8 @@ def ingest_match_statistics(
 
     return {
         "written": written,
+        "collisions": collisions,
+        "dup_fixtures": dup_fixtures,
         "skipped_existing": skipped_existing,
         "no_stats": len(no_stats),
         "failed": [source_ref for source_ref, _ in failed],

@@ -211,7 +211,9 @@ def sync_teams(conn, api, resolver: ResolutionMap, league: int, season: int) -> 
             if not entries:
                 raise SyncError(f"{endpoint} {params}: empty response[]")
 
-            venue_count = 0
+            team_ids_landed: set[int] = set()
+            venue_ids_landed: set[int] = set()
+            teams_with_venue = 0
             for entry in entries:
                 team_obj = entry.get("team") or {}
                 venue_obj = entry.get("venue") or {}
@@ -252,7 +254,17 @@ def sync_teams(conn, api, resolver: ResolutionMap, league: int, season: int) -> 
                         ],
                     )
                     resolver.remember("venues", venue_obj["id"], our_venue_id)
-                    venue_count += 1
+                    # LANDED (distinct ids), not attempts — and deliberately NO collapse
+                    # WARNING here, unlike standings (D-101) or match_statistics. A
+                    # groundshare — two teams sharing one stadium, e.g. San Siro or the
+                    # Stadio Olimpico, common outside England — upserts the SAME
+                    # (source, source_ref) venue twice, and it MUST collapse to one row.
+                    # Both teams then point at that one venue_id, which is exactly right.
+                    # That collapse is correct, desired behaviour, NOT an anomaly: a
+                    # standings-style warning would fire on every groundshare and cry
+                    # wolf on valid data. Do not add one.
+                    venue_ids_landed.add(our_venue_id)
+                    teams_with_venue += 1
 
                 # --- curated.teams ------------------------------------------
                 our_team_id = upsert_returning_id(
@@ -294,8 +306,22 @@ def sync_teams(conn, api, resolver: ResolutionMap, league: int, season: int) -> 
                     ],
                 )
                 resolver.remember("teams", team_obj["id"], our_team_id)
+                # LANDED (distinct ids), same mechanism as standings (D-101): a team
+                # repeated in the payload reports once instead of inflating the count.
+                team_ids_landed.add(our_team_id)
 
-    return {"teams": len(entries), "venues": venue_count}
+    # A repeated TEAM is not a desired collapse the way a groundshare venue is, so it
+    # must be visible — but it is not data loss (the upsert collapses correctly), so it
+    # earns no WARNING. Reporting entries (attempts) beside teams (landed) surfaces any
+    # collapse in the ordinary OK line for free, mirroring standings' {standings, attempts}.
+    # teams_with_venue vs venues is the same trick for grounds: 20 teams with a venue
+    # landing 19 distinct venues means two of them share a ground.
+    return {
+        "teams": len(team_ids_landed),
+        "entries": len(entries),
+        "venues": len(venue_ids_landed),
+        "teams_with_venue": teams_with_venue,
+    }
 
 
 # ---------------------------------------------------------------------------

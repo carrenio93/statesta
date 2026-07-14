@@ -283,6 +283,7 @@ def _resolve_or_seed_player(
     player: dict,
     fetched_at: Any,
     player_ids: dict[str, int],
+    staged_ids: dict[str, int],
 ) -> tuple[int, bool]:
     """Return (our player id, seeded?) for a lineup player.
 
@@ -294,10 +295,24 @@ def _resolve_or_seed_player(
     The insert path is not dead code: an unused substitute (named on the bench,
     never came on) has no /fixtures/players stat row, so a lineup can legitimately
     be the first place we ever see that player.
+
+    Q-NEW-AR: this function NEVER writes `player_ids`. Anything it resolves or seeds
+    goes into `staged_ids`, the caller's PER-FIXTURE staging map, because we are inside
+    that fixture's still-open transaction. If the fixture later rolls back (an unresolved
+    team, D-092, or a parse failure), the seeded row is undone — and a cached id would
+    then be a phantom: a later fixture naming the same player would take the fast path,
+    get an id whose row does not exist, and build a lineup row on a dead FK. The caller
+    merges staged_ids into player_ids only AFTER the fixture commits.
     """
     ref = str(player["id"])
 
     our_id = player_ids.get(ref)
+    if our_id is not None:
+        return our_id, False
+
+    # Seeded earlier in THIS fixture's transaction: uncommitted, but our own transaction
+    # sees it, so it resolves normally and a repeated player costs no second INSERT.
+    our_id = staged_ids.get(ref)
     if our_id is not None:
         return our_id, False
 
@@ -325,10 +340,10 @@ def _resolve_or_seed_player(
         row = cur.fetchone()
         if row is None:
             raise SyncError(f"player source_ref={ref} neither inserted nor found")
-        player_ids[ref] = row[0]
+        staged_ids[ref] = row[0]
         return row[0], False
 
-    player_ids[ref] = row[0]
+    staged_ids[ref] = row[0]
     return row[0], True
 
 
@@ -474,6 +489,14 @@ def ingest_lineups(
 
         processed += 1
         params = {"fixture": int(source_ref)}
+        # Fresh per fixture (Q-NEW-AR). staged_ids holds ids seeded/resolved inside this
+        # fixture's transaction — invisible to later fixtures until this one COMMITS. The
+        # seed count and its log lines are buffered on the same boundary, for the same
+        # reason: on rollback all three die with the iteration, so there is no phantom id,
+        # no phantom count, and no orphan SEEDED line above the FAILED line.
+        staged_ids: dict[str, int] = {}
+        fixture_seeded = 0
+        seed_logs: list[str] = []
 
         try:
             fetched = _fetch(conn, api, ENDPOINT, params)
@@ -559,11 +582,11 @@ def ingest_lineups(
                                     )
 
                                 our_player_id, seeded = _resolve_or_seed_player(
-                                    cur, player, fetched_at, player_ids
+                                    cur, player, fetched_at, player_ids, staged_ids
                                 )
                                 if seeded:
-                                    players_seeded += 1
-                                    print(
+                                    fixture_seeded += 1
+                                    seed_logs.append(
                                         f"  SEEDED new player id={player['id']} "
                                         f"{player.get('name')!r} (no /fixtures/players row)"
                                     )
@@ -608,12 +631,23 @@ def ingest_lineups(
                     fixture_rows = len(rows)
                     written += fixture_rows
 
+            # The transaction context manager exited cleanly == COMMITTED. Only now are
+            # these ids backed by rows that survive, so only now may they enter the
+            # persistent cache and be handed to later fixtures — and only now is a seed
+            # real enough to count and to log.
+            player_ids.update(staged_ids)
+            players_seeded += fixture_seeded
+            for line in seed_logs:
+                print(line)
+
             print(
                 f"  [{processed}] fixture={source_ref} -> {fixture_rows} lineup row(s)  "
                 f"remaining={remaining}"
             )
 
         except Exception as exc:  # noqa: BLE001 — one bad fixture must not abort the run
+            # staged_ids / fixture_seeded / seed_logs die with this iteration: player_ids
+            # never saw the phantom id, the count never counted it, the log never claimed it.
             failed.append((str(source_ref), str(exc)))
             print(f"  FAILED fixture={source_ref}: {exc}")
             continue
