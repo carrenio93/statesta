@@ -452,7 +452,7 @@ S14 was scoped (Rule 2) to hardening only; the Greek ingest was consciously carr
 - **What to paste at session start:** PROJECT_STATUS.md, CRITICAL_RULES.md, REQUIREMENTS.md, ARCHITECTURE.md, `CURATED_SCHEMA_REFERENCE.md`, `SYNC_INGESTION_DESIGN.md`.
 - **ClickUp:** mark `869e48mc6` (S14) done; create the S15 Greek-ingest task in the Sync Engine list (`901217784130`), backlog, linked to `869e48mc6`. **✅ Done — S15 task is `869e4t4tz`** ("Session 15 — Greek Super League (197/2025) cross-league ingest + coverage characterisation"). Mark it `in progress` at the S15 ritual.
 
-**Standing reminder — push state:** end-of-S14 all work is committed and pushed as **`b6cc7f4`** (five hardened workers + the S14 doc updates land in a second commit this session). `origin/main` == local `main`; working tree clean after that commit. Update this line to the new tip after the doc-update push.
+**Standing reminder — push state:** **verified at the S15 opening ritual (2026-07-15)** — `origin/main` == local `main` == **`8714a57`**, working tree clean, all S14 work fully pushed. Ancestry: `b6cc7f4` (five hardened workers) → `3621175` (S14 doc close-out) → `8714a57` (records the S15 ClickUp task id `869e4t4tz`). This line is a *record of a check, not a standing truth* — re-verify with `git rev-parse HEAD` + `git rev-parse origin/main` at every session ritual and update it to the new tip at every session close.
 
 ---
 
