@@ -54,6 +54,7 @@ ADMIN_OWNED_COLUMNS: dict[str, frozenset[str]] = {
     "curated.players": frozenset(),
     "curated.player_match_stats": frozenset(),
     "curated.lineups": frozenset(),
+    "curated.player_identity_links": frozenset(),
 }
 
 
