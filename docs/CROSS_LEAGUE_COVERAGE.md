@@ -117,6 +117,32 @@ A filter for *"team had ≤ 0 red cards in ≥ 80% of last 10"* under a blanket 
 
 ## 4. FINDING: Vendor dual identity — `/fixtures/lineups` uses a separate player id space
 
+> ### ⚠️ UPDATED BY SESSION 16 — READ THIS BEFORE THE REST OF §4
+>
+> **The finding is confirmed and now RESOLVED** (D-114): `curated.player_identity_links`
+> holds 56 live alias→canonical links, and `identity_links.py` reconciles any league at
+> 0 API cost. **But four claims below were corrected in S16. They are struck through in
+> place; the surrounding prose is otherwise as written in S15.**
+>
+> 1. **"`/players` emits ONLY the canonical id … the canonical side is unambiguous"** —
+>    the *fact* is right (1 of 48 refs on the roster), the *inference* is wrong.
+>    **Roster presence does not imply canonicity:** Tzovaras is on the roster under
+>    **both** ids (`2386` page 1, `353061` page 13). **Canonical is defined
+>    operationally: the id carrying the `player_match_stats` rows.**
+> 2. **"`birth_date` + name works as a fixture-independent key"** — **DEAD** (D-118).
+>    The vendor sends `{"date": null}` for the canonical twins; **0 of 817 matched pairs
+>    carry a birth date on both sides.** It could not have matched one.
+> 3. **The impact figures (381 / 898 / 65) DO NOT REPRODUCE** — S16 gets 257 / 784 / 2.
+>    **Treat every count in §4 as unverified** (Q-NEW-BF). The *population* (56 = 48+8)
+>    and the *matcher's behaviour* both reproduce exactly; only the magnitudes differ.
+> 4. **A raw jersey join is NOT a function.** It needs per-alias **majority vote**,
+>    because the vendor **mis-slots substitutes into the opponent's team block**
+>    (Q-NEW-BG) — 11 Greek aliases, one dissenting row each.
+>
+> **Also new:** the vendor supplies a different **name** as well as a different id
+> (`M. Flores` ↔ `Wellity Lucky Omoruyi` — same human, Liverpool #92). **Names are the
+> weakest evidence here; recurrence is the strongest** (D-120).
+
 **The vendor issues two different `player.id`s for the same human**, depending on the endpoint.
 
 | Endpoint | id space |
@@ -173,6 +199,8 @@ State all three or none; any one alone misleads:
 
 381 = 316 + 65. The 65 are **not new humans** — they are among the known 48 duplicates; the same-match linkage fails (different jersey that match, or no pms row that specific fixture). A residual to understand, not a new population.
 
+> **S16 correction (Q-NEW-BF): these three numbers do not reproduce.** S16 gets **257 / 255 / 2** (row-level) or **253 / 246 / 7** (player-level). `lineups` and `player_match_stats` are byte-identical to the S15 close and are the only inputs, so one of the two queries is wrong; S15's scratchpad SQL is gone, so it cannot be adjudicated. **EPL reconciles perfectly** (28→33 = S15's 33), so the definitional shift explains EPL and almost none of Greece. **Under the corrected S16 definitions there are 0 unmatched aliases in either league** — the "65" was a scoping artefact, not a population. The reconciler's own output (`aliases_found` / `linked` / `with_dissent` / `needs_review`) is now the authoritative count.
+
 ### The enrichment consequence
 
 `/players` emits **only** the canonical id. Verified against the full 28-page landed roster:
@@ -182,6 +210,8 @@ State all three or none; any one alone misleads:
 - Of the 48 Greek lineup-side refs, exactly **1** (`2386`) appears in the roster.
 
 **Therefore 47 of 48 Greek lineup-side duplicate rows are permanently bio-less.** `player_bio` reads the roster; the roster never emits their ids; they can never enrich. Not a worker defect — a structural consequence of the vendor's id split.
+
+> **S16 correction:** still true, and now **moot** — the 47 are *linked*, and their canonicals already carry bio. Read the bio **through the link**; do not enrich the alias. The alias's `photo_url` is NULL **by construction** (this endpoint carries no photo), so a UI reading the alias row directly still needs a null-photo fallback.
 
 ### This retroactively solves the EPL "8 bench-only" residual (Q-NEW-AT)
 
@@ -195,7 +225,9 @@ Q-NEW-AT characterised EPL's 39-row bio residual as *29 transferred-out + 2 stat
 - ⚠️ **`lineups` ↔ `player_match_stats` cannot be joined on `player_id`** for these players.
 - ⚠️ **Any downstream logic treating lineup membership as ground truth for "did this player start?" is wrong for ~10% of Greek player-fixture slots.**
 
-**Safe practice until reconciled:** join within a table on `(fixture_id, player_id)`. Never assume cross-table player-id membership between `lineups` and `player_match_stats`.
+~~**Safe practice until reconciled:** join within a table on `(fixture_id, player_id)`. Never assume cross-table player-id membership between `lineups` and `player_match_stats`.~~
+
+> **S16 — SUPERSEDED (D-114).** Cross-table player joins are now safe **through the link table**: resolve `lineups.player_id` via `curated.player_identity_links.alias_player_id → canonical_player_id`, falling back to the id itself when no link row exists (absence = already canonical, or unresolved). **Do not join raw `player_id` across the two tables without that resolution step** — the 56 aliases will silently miss. A `v_lineups_resolved` view was deliberately deferred (Rule 2): nothing consumes it yet, and the link table is the source of truth regardless.
 
 ---
 
@@ -348,6 +380,16 @@ Run this before trusting a new league's data. Each item exists because it caught
 15. Coach null-rate; distinct coaches; mid-season changes.
 16. DB size delta → cost per league-season.
 
+**Identity — added Session 16 (D-114…D-121)**
+
+17. **Verify jersey uniqueness BEFORE relying on it.** `(fixture_id, team_id, jersey_number)` in *both* `lineups` and `player_match_stats` — **no DB constraint enforces it**; it is a data property. Also count NULL jerseys: a NULL cannot match. (Both leagues: 0 violations, 0 NULLs — but that is two data points, not a law.)
+18. **Run the reconciler — it is NOT automatic** (D-115). `python -m statesta_sync.identity_links --league N --season Y --dry-run` first (it exercises the real write path and rolls back, D-119), then live. It must run **after** `player_match_stats` and `lineups`, and it makes **zero API calls**.
+19. **Read the reconciler's output as the census, not the run log**: `aliases_found` (how many divergent ids this league minted), `linked`, `with_dissent` (Q-NEW-BG mis-slots), `needs_review` (single-row hypotheses), `ambiguous` (ties — refused, **investigate every one**), `unmatched` (aliases with no jersey counterpart at all — **investigate every one**).
+20. **Eyeball the alias→canonical name pairs.** Not as a test — as a *sanity read*. **Names disagreeing does NOT mean the link is wrong** (D-120: `M. Flores` ↔ `Wellity Lucky` is one human; the vendor renames as well as re-ids). Names agreeing does not mean it is right either. **Recurrence is the evidence; names are decoration.**
+21. **If this league breaks the majority-vote rule** — a near-even split, a chain, reverse ambiguity — **stop and re-derive**. `uq_pil_alias` assumes one canonical per alias, and that assumption is earned per league, not granted.
+
 **The standing lesson**
 
 > Architectural reasoning about this vendor has been wrong repeatedly and empirical checks have been right every time. When a prediction is cheap to test, test it instead of trusting it. Several S15 findings — dual identity, mixed units, the EPL "8 bench-only" — were the *opposite* of a confident prediction.
+>
+> **S16 sharpened this to the point of embarrassment: seven predictions falsified in a single session**, including an "unknown process writing to production" that was S15's own `player_bio` run crossing midnight, and a "zero ambiguity, both leagues" result that was an artefact of a filter which also hid the counter-example. **Every one was caught by a check designed because the prediction was uncertain.** The rule now extends to Claude's own artefacts: **derive literals from the code, never hand-type from memory** — S16 lost time to a missing `updated_at` trigger, `Json` vs `Jsonb`, and an expectation about a comment in a file written forty minutes earlier.
