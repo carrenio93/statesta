@@ -1,0 +1,132 @@
+{
+  "phantom_player_id": 26963,
+  "captured_purpose": "S18 id=0 backfill deletes these links; recorded for Q-NEW-BO. Each alias was reconciled onto the phantom by S16 identity logic; the canonical was a misattribution bucket, so the links are void, but the alias ids are kept here in case a future identity_links run re-links them to the correct per-appearance synthetic players.",
+  "link_count": 5,
+  "links": [
+    {
+      "id": 225,
+      "alias_player_id": 45460,
+      "canonical_player_id": 26963,
+      "match_method": "jersey_fixture_team_majority",
+      "match_pair_count": 1,
+      "match_dissent_count": 0,
+      "needs_review": true,
+      "match_evidence": {
+        "chosen": 26963,
+        "candidates": {
+          "26963": 1
+        },
+        "dissent_rows": [],
+        "sample_pairs": [
+          {
+            "team_id": 99,
+            "fixture_id": 1590,
+            "jersey_number": 55
+          }
+        ],
+        "majority_fraction": 1.0
+      },
+      "name": "V. Viana"
+    },
+    {
+      "id": 226,
+      "alias_player_id": 45461,
+      "canonical_player_id": 26963,
+      "match_method": "jersey_fixture_team_majority",
+      "match_pair_count": 1,
+      "match_dissent_count": 0,
+      "needs_review": true,
+      "match_evidence": {
+        "chosen": 26963,
+        "candidates": {
+          "26963": 1
+        },
+        "dissent_rows": [],
+        "sample_pairs": [
+          {
+            "team_id": 95,
+            "fixture_id": 1595,
+            "jersey_number": 71
+          }
+        ],
+        "majority_fraction": 1.0
+      },
+      "name": "Lyan Araujo"
+    },
+    {
+      "id": 227,
+      "alias_player_id": 45462,
+      "canonical_player_id": 26963,
+      "match_method": "jersey_fixture_team_majority",
+      "match_pair_count": 1,
+      "match_dissent_count": 0,
+      "needs_review": true,
+      "match_evidence": {
+        "chosen": 26963,
+        "candidates": {
+          "26963": 1
+        },
+        "dissent_rows": [],
+        "sample_pairs": [
+          {
+            "team_id": 104,
+            "fixture_id": 1599,
+            "jersey_number": 71
+          }
+        ],
+        "majority_fraction": 1.0
+      },
+      "name": "Gabriel Silva"
+    },
+    {
+      "id": 232,
+      "alias_player_id": 45468,
+      "canonical_player_id": 26963,
+      "match_method": "jersey_fixture_team_majority",
+      "match_pair_count": 1,
+      "match_dissent_count": 0,
+      "needs_review": true,
+      "match_evidence": {
+        "chosen": 26963,
+        "candidates": {
+          "26963": 1
+        },
+        "dissent_rows": [],
+        "sample_pairs": [
+          {
+            "team_id": 97,
+            "fixture_id": 1700,
+            "jersey_number": 62
+          }
+        ],
+        "majority_fraction": 1.0
+      },
+      "name": "C. Lucas"
+    },
+    {
+      "id": 236,
+      "alias_player_id": 45472,
+      "canonical_player_id": 26963,
+      "match_method": "jersey_fixture_team_majority",
+      "match_pair_count": 1,
+      "match_dissent_count": 0,
+      "needs_review": true,
+      "match_evidence": {
+        "chosen": 26963,
+        "candidates": {
+          "26963": 1
+        },
+        "dissent_rows": [],
+        "sample_pairs": [
+          {
+            "team_id": 108,
+            "fixture_id": 1752,
+            "jersey_number": 37
+          }
+        ],
+        "majority_fraction": 1.0
+      },
+      "name": "Cauan Baptistella"
+    }
+  ]
+}
