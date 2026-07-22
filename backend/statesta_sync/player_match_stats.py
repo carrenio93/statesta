@@ -305,18 +305,61 @@ def _build_stats_values(
     }
 
 
-def _upsert_player_seed(cur, player: dict, fetched_at: Any) -> int:
+def _effective_player_ref(
+    player_id: Any, fixture_ref: Any, team_ref: Any, jersey: Any
+) -> str | None:
+    """The seed + dedup key for one player entry.
+
+    Real players: their vendor id as text (unchanged). Vendor-UNIDENTIFIED players,
+    which API-Football stamps as id 0, get an appearance-scoped synthetic ref
+    ``0:{fixture}:{team}:{jersey}`` (D-124) so distinct unnamed players never merge
+    onto one curated.players row — ':' can never appear in a real integer id, so the
+    two ref spaces cannot overlap. Returns None when id == 0 AND jersey is absent: no
+    stable key exists, so the caller skips the appearance and logs it (Q-NEW-BN).
+    """
+    if player_id != 0:
+        return str(player_id)
+    if jersey is None:
+        return None
+    return f"0:{fixture_ref}:{team_ref}:{jersey}"
+
+
+def _upsert_player_seed(cur, player: dict, effective_ref: str, fetched_at: Any) -> int:
     """Thin-seed a player and return our surrogate id.
 
-    Only name + photo_url are set/refreshed; the bio columns stay untouched so a
-    later /players enrichment is never overwritten (decision 2A, D-064).
+    Real players: only name + photo_url are set/refreshed; bio columns stay untouched
+    so a later /players enrichment is never overwritten (decision 2A, D-064).
+
+    Vendor-unidentified players (id 0): we NEVER store the vendor's name — the vendor
+    flagged this player as unidentifiable, so showing its name would assert an identity
+    we don't have (D-124, client-integrity rule). name is the honest literal
+    'Unidentified player'; photo is dropped (could be the wrong face); the vendor's name
+    is kept as provenance only in source_extra, never a display field.
     """
+    if player.get("id") == 0:
+        return upsert_returning_id(
+            cur,
+            "curated.players",
+            values={
+                "source": SOURCE,
+                "source_ref": effective_ref,
+                "source_fetched_at": fetched_at,
+                "sport": SPORT,
+                "name": "Unidentified player",
+                "photo_url": None,
+                "source_extra": Jsonb(
+                    {"vendor_unverified_name": player.get("name"), "vendor_player_id": 0}
+                ),
+            },
+            conflict_columns=["sport", "source", "source_ref"],
+            update_columns=["source_fetched_at", "name", "photo_url", "source_extra"],
+        )
     return upsert_returning_id(
         cur,
         "curated.players",
         values={
             "source": SOURCE,
-            "source_ref": str(player["id"]),
+            "source_ref": effective_ref,
             "source_fetched_at": fetched_at,
             "sport": SPORT,
             "name": player.get("name"),
@@ -398,6 +441,7 @@ def ingest_player_match_stats(
     written = 0            # player_match_stats rows written
     dupes = 0              # duplicate player entries skipped (kept first occurrence)
     players_upserted = 0   # curated.players thin-seed upserts (incl. re-seeds)
+    id0_no_jersey_skipped = 0  # D-124/Q-NEW-BN: id=0 appearances with no jersey key
     skipped_existing = 0
     no_stats: list[str] = []
     failed: list[tuple[str, str]] = []
@@ -485,17 +529,37 @@ def ingest_player_match_stats(
                                     f"(fixture={source_ref}, team={team_ref})"
                                 )
 
-                            player_ref = str(player["id"])
+                            stats_list = entry.get("statistics") or []
+                            stat = stats_list[0] if stats_list else {}
+                            jersey = _dig(stat, "games", "number")
+
+                            # D-124: id 0 is the vendor's "unidentified" sentinel and a
+                            # SHARED bucket — de-collide it into a per-appearance ref so
+                            # distinct unnamed players neither merge onto one row nor get
+                            # dropped by the dedup below. None => id 0 with no jersey: no
+                            # stable key, skip + log, raw stays for audit (Q-NEW-BN).
+                            player_ref = _effective_player_ref(
+                                player["id"], source_ref, team_ref, jersey
+                            )
+                            if player_ref is None:
+                                id0_no_jersey_skipped += 1
+                                print(
+                                    f"  WARNING  id=0 with NULL jersey "
+                                    f"(fixture={source_ref}, team={team_ref}) — no stable "
+                                    "key, skipped; raw landed for audit (Q-NEW-BN)"
+                                )
+                                continue
+
                             if player_ref in seen_refs:
                                 fixture_dupes += 1
                                 continue
                             seen_refs.add(player_ref)
 
-                            our_player_id = _upsert_player_seed(cur, player, fetched_at)
+                            our_player_id = _upsert_player_seed(
+                                cur, player, player_ref, fetched_at
+                            )
                             players_upserted += 1
 
-                            stats_list = entry.get("statistics") or []
-                            stat = stats_list[0] if stats_list else {}
                             values = _build_stats_values(
                                 stat, our_fixture_id, our_player_id,
                                 our_team_id, fetched_at, unmapped_seen,
@@ -546,6 +610,12 @@ def ingest_player_match_stats(
         for source_ref, message in failed:
             print(f"        fixture={source_ref}: {message}")
 
+    if id0_no_jersey_skipped:
+        print(
+            f"\nNOTE  {id0_no_jersey_skipped} id=0 appearance(s) had a NULL jersey and "
+            "were skipped (no stable key, Q-NEW-BN) — raw landed for audit"
+        )
+
     print(
         f"\nAPI calls made: {calls_made}  (last remaining budget: {remaining})"
         f"  players upserted: {players_upserted}"
@@ -555,6 +625,7 @@ def ingest_player_match_stats(
         "written": written,
         "dupes": dupes,
         "players_upserted": players_upserted,
+        "id0_no_jersey_skipped": id0_no_jersey_skipped,
         "skipped_existing": skipped_existing,
         "no_stats": len(no_stats),
         "failed": [source_ref for source_ref, _ in failed],
