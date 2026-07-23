@@ -1,292 +1,374 @@
-# COMPUTED_LAYER_DESIGN.md
+# COMPUTED_LAYER_DESIGN.md — v2
 
-> **Session 19 deliverable — scoping & design, NOT implementation.**
-> This document decides *what* the Computed layer produces, *how* it is computed and stored, *how* it must respect the data landmines we found in S15–S18, and *in what order* we build it. It contains no DDL and no worker code — those come in later sessions, one slice at a time, the way ingestion did.
+> **Version 2 (Session 20).** v1 (Session 19, commit `521a291`) established the layer's purpose, the Season Resolver, point-in-time correctness, tiered freshness, and the build order. **v2 makes it buildable.** It was triggered by eight screenshots of the ScoutEngine v2.7 prototype, checked against `CURATED_SCHEMA_REFERENCE.md` and `REQUIREMENTS.md` — the check found enough structural gaps that revising before building is far cheaper than retrofitting after.
 >
-> **Grounded in:** `ARCHITECTURE.md` §4 (data layers), §5 (services & cadence), §6.3 (methodology versioning), the Season Resolver decision (§ "Season Resolver"); `REQUIREMENTS.md` §4.1 (Filter Engine), §4.3 (Backtest), §4.6 (Opportunities), §7.2 (Computed-layer workflows); and decisions D-016, D-030, D-034, D-108, D-109, D-110, D-124.
+> **What changed from v1:** the storage model (§3 — base measures vs derived metrics, the central idea), the grain model (§4 — entities beyond teams), the Season Resolver contract (§5 — season mode), two artifacts v1 never named (§8 — point-in-time standings, league completion), and a concrete performance and incremental-compute design (§7).
 >
-> **Status:** proposed. Decisions below are drafted as D-126…D-133 and become final only when logged into `PROJECT_STATUS.md` §7 at session close.
+> **Superseded:** D-128 and D-134 are revised by D-137/D-138 — the direction (KPIs are data, not columns; no pre-baked windows) is unchanged and reaffirmed; the *storage shape* that delivers it is better.
+>
+> **Status:** proposed. Decisions D-137 → D-148 become final when logged into `PROJECT_STATUS.md` §7 at session close.
 
 ---
 
-## 1. What the Computed layer is for
+## 1. What this layer is for
 
-**In one sentence:** the Computed layer is where we turn clean curated data into the pre-chewed answers the product sells, so that when a user runs a filter or opens a match, the server does an indexed *lookup* instead of a live *calculation*.
+**In one sentence:** the Computed layer turns clean curated data into the pre-chewed answers the product sells, so a user's filter is an indexed *lookup and a tiny arithmetic step* rather than a live scan of history.
 
-Everything we have built for 18 sessions is the Curated layer: one honest, normalised record per real-world thing (a fixture, a team's match stats, a player's appearance). That data is correct, but it is *raw material*. A user does not want "here are 380 fixtures and their stats" — they want "these 6 upcoming matches fit your strategy, and here is the one bet with the biggest edge." Producing that answer means scanning hundreds of past matches, computing hit rates, comparing to bookmaker odds. Doing that *live*, per request, would be slow and would repeat the same heavy work for every user who runs a similar filter. So we do it **once, nightly, in the background**, and store the results. (`ARCHITECTURE.md` §3, "the commitment"; REQUIREMENTS Architectural Commitment 2.)
-
-**Its consumers (who reads it):**
-- The **Filter Engine** (Match Analysis, REQUIREMENTS §4.1) — reads pre-computed team form snapshots and mostly just looks up "did this team clear this threshold often enough."
-- The **Event Page / Opportunities** (REQUIREMENTS §4.6) — reads per-fixture opportunities.
-- **Best Picks** (REQUIREMENTS §5.7) — reads the high-edge opportunities across all upcoming fixtures.
-- The **Backtest Engine** (REQUIREMENTS §4.3) — reuses the *same* form logic against historical fixtures.
-
-**What it must NEVER do:**
-- It must never be the source of truth. It is **regenerable** — if we lost the entire Computed layer, we could rebuild it from Curated. Losing it costs compute time, not data (`ARCHITECTURE.md` §4).
-- It must never be written by the user-facing `web` service. Only the `job-worker` writes here (`ARCHITECTURE.md` §5). This is architectural: a user request physically cannot corrupt analytical data.
-- It must never leak the future into the past. See §3 — this is the single most important rule in the whole layer.
-
-### 1.1 The user concept this layer exists to serve
-
-Stated in the product owner's words, because every technical choice below serves only this:
+### 1.1 The user concept it serves
 
 > A user builds filters — some describing the **home** team, some describing the **away** team (player-prop filters come later) — and gets back the **upcoming fixtures** whose teams match those conditions, ranked by how well they match.
 
-Each filter is a question of the form *"has this team done X often enough in its recent matches?"* (e.g. "scored 2+ goals in ≥60% of its last 10"). A fixture is scored by how many filters pass; the user sets a minimum score, and matches below it are dropped (ScoutEngine prototype §5; REQUIREMENTS §4.1). The mapping from that concept to this design:
+Each filter asks: *"did this team have [metric] [≥/≤] [value] in [≥/≤] [pct]% of its last [N | this season] [all/home/away] matches?"* A fixture scores by how many filters pass; the user sets a minimum score (REQUIREMENTS §4.1; prototype §5).
 
 | The user wants… | …served by |
 |---|---|
-| filters on the **home** team *and* the **away** team | the per-team **form base** (§3.3) — home filters read the home team's form, away filters the away team's; the Filter Engine combines them into the fixture score |
-| **recent form** with a window *they* choose (last 7? last 15?) | **query-time windowing** over the form base (§3.3) — no window is pre-baked |
-| **future events** that match | the **hot tier** (§4.3) — the upcoming window, kept fresh intraday |
-| **player props**, later | **Phase 2 player form** (§2, D-131) — sequenced after the team-level MVP |
-| answers that feel **instant** | the **cached, index-only, bounded scan** read path (§4.5) |
+| filters on **home** *and* **away** teams | per-team form base (§3), combined into a fixture score by the Filter Engine |
+| **recent form**, window *they* choose (last 7? 15? this season?) | query-time windowing over an ordered base (§3.4) + Season Resolver season mode (§5.3) |
+| **future events** that match | the **hot tier** (§6) — the upcoming window, fresh intraday |
+| **new KPI ideas later**, cheaply | the **metric registry** (§3.2) — one config row, zero backfill |
+| answers that feel **instant** | §7 — bounded reads, covering indexes, hot-window cache |
+| **player props**, later | Phase 2 player grain (§4) |
 
-Everything after this point is *how* we make that concept correct (§3), extensible (§4.2), fresh (§4.3), and fast (§4.5).
+### 1.2 Non-negotiables
 
----
-
-## 2. The catalogue — what lives in the Computed layer
-
-The layer holds three stored artifacts plus one shared primitive underneath them. They form a dependency chain: each one is computed *after* the one it depends on, nightly (REQUIREMENTS §7.2; `ARCHITECTURE.md` §5).
-
-| Artifact | Grain (one row per…) | Depends on | MVP? | Decision |
-|---|---|---|---|---|
-| **Season Resolver** *(primitive, not a stored table — see §3)* | — (a function/component) | Curated fixtures + standings | **MVP** | Q-NEW-G shape |
-| **Team form base** | team × completed match × measure *(query-time windowing, §3.3)* | Season Resolver + curated match stats | **MVP** | D-016 / D-128 |
-| **Per-fixture opportunities** | fixture × market × selection | Form snapshots + curated odds + methodology | **MVP** | D-030 |
-| **Best Picks feed** | (a filtered view over opportunities) | Opportunities | **MVP** | D-034 |
-| Player form snapshots | player × as-of-date | Resolver + curated player stats + identity links | **Phase 2** | REQUIREMENTS §6.3 |
-
-**Player form snapshots are explicitly Phase 2** (REQUIREMENTS §6.3, §4.4). This matters for our roadmap (§6): the two hardest curated landmines — dual identity (D-110) and id=0 synthetics (D-124) — only become *critical* at the player-form slice, which is Phase 2. They do not block the MVP team-form work.
-
-The **cadence chain** (nightly, dependency-aware, each step restartable, upstream failure blocks downstream — REQUIREMENTS §7.2):
-
-```
-match-stats sync ──▶ team form base ──▶ opportunities ──▶ Best Picks
-                          (D-128)              (D-030)          (D-034)
-        (Season Resolver is called *inside* form-base build + opportunities)
-```
+- **Never the source of truth.** Fully regenerable from Curated; losing it costs compute time, not data.
+- **Never written by the `web` service.** Only the job-worker writes here — a user request cannot corrupt analytical data.
+- **Never leaks the future into the past.** §5. The single most important rule in the layer.
 
 ---
 
-## 3. Point-in-time correctness & the Season Resolver — the heart of the design
+## 2. The workload, measured
 
-**This is the section that justifies making S19 a design session.** Get this wrong and every number the product shows is quietly a lie.
+Design decisions should follow the actual shape of the work, so:
 
-### 3.1 The landmine, in plain language
+| Quantity | Value | Source |
+|---|---|---|
+| Historical fixtures (prototype scale) | ~175,000 | v2.7 doc |
+| Fixtures currently ingested (3 leagues) | 996 | EPL 380 + Greece 236 + Brazil 380 |
+| Upcoming fixtures live at any moment | ~614 | prototype header |
+| **Share of data that is "live"** | **~0.35%** | 614 / 175,223 |
+| Base-measure rows implied at full scale | ~350,000 (2 per fixture) | §3.1 |
+| Filter look-back ceiling | 40 matches | REQUIREMENTS §4.1 |
 
-When we tell a user "Arsenal scored in 70% of their last 10 matches," the phrase *last 10* is defined **relative to a specific date**. For an upcoming match on 1 March, "last 10" means the 10 completed matches *before* 1 March. For a **backtest** of a match that was played on 1 October last year, "last 10" must mean the 10 completed *before* 1 October last year — it must **not** include anything that happened on or after that date.
-
-If a backtest accidentally includes future results, it becomes wildly, silently profitable — because it is effectively betting with knowledge of what already happened. This is called **look-ahead bias**, and it is the classic way analytics products fool themselves. Our whole value proposition is "trusted, transparent research"; a backtest that leaks the future destroys that in one stroke.
-
-So the rule, stated once and enforced everywhere:
-
-> **Every form number is computed *as of* a date, and may only see completed fixtures strictly *before* that date.**
-
-### 3.2 The Season Resolver (D-127)
-
-Rather than re-implement "which matches count, and in what order" in four different places (filter engine, backtest, form-snapshot computer, opportunities engine), the architecture already commits to a **single stateless component** that answers one question (`ARCHITECTURE.md` "Season Resolver"; Q-NEW-G):
-
-> **Given `(team_id, as_of_date, tier_scope)`, return the ordered list of fixtures that count as this team's relevant history as of that date.**
-
-Every consumer calls this one implementation. That guarantees the filter engine and the backtest engine agree by construction — they can't drift, because they share the resolver. The resolver's contract:
-
-- **Input:** a team, an as-of-date, and a tier-scope (which league tiers the user's analysis is restricted to — REQUIREMENTS §4.2, the "Tier scope" glossary term).
-- **Output:** the team's completed fixtures, strictly before the as-of-date, within the tier-scope, ordered most-recent-first. The "last N" is then simply the first N of that list.
-- **It is stateless and pure:** same inputs → same output, always. It reads Curated, computes nothing persistent, writes nothing. That makes it trivially testable (§8).
-
-**Two real design questions the resolver forces us to answer** (I am flagging these rather than silently deciding — Rule 9):
-
-- **Q-NEW-BP — as-of-date granularity.** We can't snapshot "every possible date." The natural choice: compute a snapshot **as of each fixture's kickoff date** (so every match that ever needed a form number has one) plus a rolling **"today"** snapshot for upcoming fixtures. This keeps the snapshot table finite and aligned to real decision points. *Proposed default: kickoff-date + today. Confirm at review.*
-- **Q-NEW-BQ — split-season scope (Greek Super League).** Greece splits into Regular Season → Championship/Relegation groups (D-100, S13). Does a team's Championship-round match belong in the *same* form window as its Regular-Season matches, or are they separate competitions? This changes what "last 10" means for half our launch market. *Proposed default: same continuous window (they are the same team, same season, chronological), with the group recorded so a future methodology can weight them differently. Confirm at review — this is a genuine sporting-logic call, not a purely technical one.*
-
-### 3.3 The form base on top of the resolver (D-128, revised in S19)
-
-**A correction driven directly by how users interact — and it's the important one.** In the filter, the user controls the window: "last N" is user-set (roughly 1–40), and so are the threshold and the percentage (ScoutEngine prototype §5.1/§5.3; REQUIREMENTS §4.1). There is therefore **no single window to pre-bake.** Storing "last-10 goals average = 1.4" is useless the moment the user picks last-7 or last-15. So we deliberately do **not** pre-store finished per-window answers. Instead:
-
-- We pre-compute the **form base**: for each team, **one ordered row per completed match per measure** — the measure's value in that match, plus context (home/away split, opponent, opponent-quality *as of that date*, competition/group). Ordered most-recent-first; point-in-time by construction, because the ordering *is* the Season Resolver's output.
-- **"As of date X" becomes a query predicate** (`match_date < X`), not a stored key — so any as-of-date works for free, with no snapshot explosion.
-- The final test — *"≥ threshold in ≥ pct% of the last N"* — is computed **at query time** as a bounded scan over at most ~40 rows per team. That's microseconds, and it is the *only* way to honour user-tunable N / threshold / percentage.
-
-**The pre-computation boundary, stated once:** pre-compute the expensive, reusable *ingredients* (the ordered per-match values and the opponent-quality tags, which are costly to derive live because they need standings as-of-date); compute the cheap, user-specific *final aggregation* live. This is both more flexible (any N, any threshold, any date) **and** fast (§4.5) — the two stop being in tension once we stop pre-baking answers.
-
-The **measures** the form base carries (goals, corners, cards, shots, possession, form points, etc.) are **defined by REQUIREMENTS §4.1** and governed by the metric registry (§4.2) — not re-invented here. Fixed-window numbers that appear on a card or drive a Best-Picks default (e.g. "form last 5") are an *optional derived convenience* materialised on top of the form base, never the primary structure. Exact column/measure names are confirmed against `CURATED_SCHEMA_REFERENCE.md` at implementation — **not hand-typed here** (standing rule).
+**Three consequences.** (1) Over 99% of the data is **immutable history** — compute once, freeze (§6). (2) The live read path touches **at most 40 rows per team**, which is why it can be fast (§7). (3) The genuinely heavy path is the **backtest** (12 months × all fixtures in scope), which is why it belongs on a background queue and why the frozen tier is what makes it survivable.
 
 ---
 
-## 4. Computation, storage, extensibility & freshness
+## 3. The storage model — base measures vs derived metrics
 
-### 4.1 Schema, ownership, idempotency
+**This is the central idea of v2, and it came from reading the prototype's metric dropdown carefully.**
 
-- **Its own schema.** The Computed layer lives in a dedicated `computed` Postgres schema, consistent with our one-schema-per-layer convention (raw / curated / …). (D-126.)
-- **Written only by the job-worker**, chained off sync completion, plus on-demand and event-driven triggers (§4.3; REQUIREMENTS §7.2; `ARCHITECTURE.md` §5). The `web` service never writes here.
-- **Idempotent by natural key.** Every artifact upserts on its grain key (§2). A re-run overwrites cleanly; a crashed run resumes without duplication. This mirrors the transaction-per-unit discipline that carried our ingestion workers through three mid-run interruptions (S17).
-- **Regenerable from Curated.** No artifact is authoritative; all are rebuildable. (D-126.)
+### 3.1 The observation
 
-### 4.2 Extensibility — adding a KPI later must not be a rebuild (D-134)
+The catalogue advertises ~40 metrics. But look at the Goals group: *Goals Scored, Goals Conceded, Total Goals, Both Teams Scored, Clean Sheet, Won to Nil, Scored 2+, Scored 3+, Over 2.5, Over 3.5, Goalless Draw*, plus *Win / Draw / Loss*. **Thirteen metrics, two underlying numbers** — goals for and goals against. Clean Sheet is `against = 0`. Over 2.5 is `for + against > 2.5`. Win is `for > against`.
 
-**This is a first-class design goal, not an afterthought:** we must be able to invent a new KPI six months from now and add it *without* a schema migration, a backfill scramble, or touching unrelated code. There are two ways to store form metrics, and the choice *is* this goal:
+The Cards group behaves identically: yellows and reds (own and opponent) generate *Cards For, Cards Against, Cards Total, 3+/4+/5+ Cards Match, 2+ Yellows*. Corners: three metrics from two numbers.
 
-- **Wide table** — one column per metric-and-window (`goals_scored_last10`, `corners_for_last10`, …). Reads look trivial, but it fails **twice**: every new KPI is a schema migration (alter, backfill, edit worker, edit API — the "messing up the whole tables" fear), *and* it hard-codes the window (`last10`), which the user actually controls (§3.3). A wide table literally cannot represent "user picked last-7."
-- **Long (tall) form base** — one row per `(team_id, match_date, metric_key, split)` carrying `value`, plus context (opponent, opponent-quality-as-of-date, group), `coverage_present`, `methodology_version`. Adding a KPI = write rows under a new `metric_key`. **Zero DDL** — *and* the window is not baked in, so any user N works (§3.3).
+So the catalogue is not ~40 independent things to store. It is **~15 irreducible measurements** and **~25 questions asked about them**.
 
-**Decision (D-134): the long-format form base (§3.3) is the extensibility spine, fronted by a metric registry.** The **metric registry** is a small config table describing each KPI: its `metric_key`, human description, the curated measure(s) it reads, its **NULL policy** (`zero` | `unknown`, per D-129), and whether it is **coverage-aware** (per D-130). We store per-match *values*, never per-window aggregates or user thresholds — those are query-time (§3.3). Consequences:
+### 3.2 The decision (D-137)
 
-- **Adding a KPI = one registry row** (+ one small pure function only if it needs genuinely new math). No migration, no table surgery, no risk to existing metrics, and it immediately works at every N the user can pick.
-- The awkward-data policies (D-129 NULL handling, D-130 coverage) **live on the metric definition**, so they travel with the metric automatically — a new metric declares its own policy and the compute engine honours it generically.
-- **Performance escape hatch:** if a handful of the hottest *fixed-window* numbers (card displays, Best-Picks defaults) ever need extra speed for the <3s / <500ms targets (REQUIREMENTS §8.1), we add a *derived* index-only projection for only those — built *from* the form base, never a second source of truth, and added only if measurement shows we need it (don't pre-optimize).
+> **Store the irreducible base measurements. Define every derived metric as a registry entry evaluated at query time.**
 
-This is the concrete answer to "can we add KPIs we haven't thought of yet without a mess": yes — KPIs are **data (registry rows), not columns.**
+- **Base measures** — what the vendor actually measured, per team per match: goals for/against, half-time goals for/against, corners for/against, yellows/reds (own and opponent), shots and shots-on-target (for/against), possession, fouls, offsides, xG, goals prevented, passes (total/accurate), GK saves. A bounded, slow-changing set that mirrors `curated.match_statistics` + `curated.fixtures`.
+- **Derived metrics** — registry rows carrying a name, a category, and an expression over base measures (`clean_sheet := goals_against = 0`). **No storage at all.**
 
-### 4.3 Freshness — tiers, not one nightly batch (D-135)
+**Why this is the right cut.** The two groups have completely different change profiles. Base measures change when *the vendor changes what it sends* — rare, and genuinely new data either way. Derived metrics change when *we have a new idea* — often, and that must be free.
 
-"The sync must be very frequent — this is a real app." Correct. The reconciliation rests on two distinctions.
+**What it buys — the direct answer to "can I add a KPI later without a rebuild":**
 
-**Two clocks.** *Ingestion sync* (the upstream workers pulling facts from API-Football — how fast new facts land) and *compute refresh* (this layer — how fast KPIs reflect those facts) are **different machinery**. This document owns the second; the first is an adjacent lever (and affordable — Ultra is flat-rate with ~75k/day budget against a few-thousand actual, so frequent polling costs us nothing extra).
-
-**The past never changes.** A match played last October has a fixed history, so its snapshot is computed **once and frozen**. This means we never need to recompute the universe on a fast clock — only the slice that can still move.
-
-**So the freshness design is tiered (D-135):**
-
-| Tier | What | Refresh cadence | Why |
-|---|---|---|---|
-| **Frozen** | Snapshots as-of any *past* date | Computed once; never recomputed (except a rare corrected past result → targeted recompute) | History is immutable |
-| **Hot** | Snapshots for the **upcoming window** (today + next few match-days) + opportunities for upcoming fixtures | **Event-driven, intraday** — retriggered when new match stats land (~1 h after a fixture ends, §6.6) or odds move; nightly full sweep as the safety net | This is the *only* window users query live, and the only one whose inputs are still changing |
-
-**Grounding in how users actually interact.** Users build a filter and run it against **upcoming** matches, expecting a result in **under 3 seconds** (REQUIREMENTS §8.1); they open an **event page** for an upcoming fixture to see opportunities; they scan the **Best Picks** feed of upcoming high-edge bets (REQUIREMENTS §4.1, §4.6, §5.7). Nobody runs a live filter against a 2019 season. So the *upcoming window* is exactly what must be both **pre-computed** (for the <3s lookup) and **fresh** (intraday on match days, §6.6). Tiering gives us "very frequent where it matters, cheap everywhere else."
-
-The exact trigger wiring (event hooks vs short-interval polling of the hot window) is an implementation detail for the relevant slice; the design commitment is the tiering and the event-driven hot refresh.
-
-**Per-category cadences — different clocks for odds vs fixtures vs stats (and that's correct).** There is no single "sync." Each data type refreshes on its own schedule (REQUIREMENTS §6.6): match stats within ~1 h of a fixture ending, lineups every 3–4 h on match days, odds daily-plus-intraday, standings daily, fixtures nightly-plus-intraday on match days. These are *ingestion* schedules (upstream of this layer, and cheap — flat-rate Ultra), but they matter here because **the hot-tier compute refresh subscribes to each category independently**: a fresh odds pull re-runs opportunities for the affected fixtures only; a landed match stat re-runs the affected slice of the form base only. So "a different frequency for odds than for fixtures" isn't something we bolt on — it falls out naturally as independent triggers feeding independent recomputes. *(The precise per-category ingestion schedule is owned by the ingestion/scheduling work, not this doc; it's wired when we set up the unattended cadence — the same session Q-NEW-BL's exit-code hardening lands, §7.)*
-
-### 4.4 Full vs incremental recompute; methodology stamp
-
-- **Full vs incremental.** The normal refresh is incremental — recompute only new/affected rows (the hot tier). A full rebuild from Curated is always available as an on-demand job (regenerability, §4.1). Both modes must produce identical results.
-- **Methodology-version stamped.** Every computed row carries the methodology version that produced it (§5), including every row in the form base.
-
-### 4.5 Performance — how "ultra-fast" is actually achieved (D-136)
-
-Your instinct is right: a wide table with many columns is neither flexible nor obviously fast. Speed comes from **bounded work + indexes + cache**, *not* from column count:
-
-1. **Bounded final step.** The filter's live computation is a scan over ≤~40 rows per team (§3.3), never a full-table scan. Small N is the whole game — the work per team is tiny and constant regardless of how much history we hold.
-2. **Index-only scans.** The form base is indexed on `(team_id, metric_key, split, match_date DESC)` with `value` carried in the index, so "last N of this measure for this team" is answered from the index without touching the table heap.
-3. **Partitioning + cheap date pruning.** Partition the form base by season (and/or league) so a query touches only relevant partitions; a BRIN index on `match_date` makes range pruning almost free.
-4. **Application cache (Redis / Upstash — already in our planned stack).** Hot filter *results* and hot team form bases are cached, invalidated by the hot-tier refresh events (§4.3). This is the grown-up version of the prototype's in-memory LRU (4 h TTL, 8k entries), moved out of process so every server instance shares it.
-5. **Optional fast-lane materializations.** For the few highest-traffic *fixed-window* numbers (card displays, Best-Picks defaults), a tiny derived index-only projection — added only if measurement shows the live path misses the <3s / <500ms targets (§8.1). Don't pre-optimize.
-6. **Heavy work is async.** Backtests scan many historical fixtures (targets <10s typical, <60s heavy, §8.1); those run as Dramatiq background jobs, never blocking a live request.
-
-Net: the live read path is a **cached, index-only, bounded scan.** That's how the app stays fast *and* stays flexible — the two only conflicted while we were pre-baking answers, and §3.3 stopped doing that.
-
----
-
-## 5. Methodology versioning — mechanism now, numbers later
-
-The math behind hit rates, opportunities, and Best Picks — the coefficients, look-back sizes, weighting factors, edge thresholds — is **versioned** (`ARCHITECTURE.md` §6.3; REQUIREMENTS Configuration Layer). Every Computed row is **stamped with the methodology version that produced it**.
-
-**Why it matters:** methodology *will* change as we improve. If old outputs aren't stamped, "did this strategy work last season?" becomes unanswerable — you'd be comparing numbers made by different math and not know it. Stamping keeps historical performance honest across methodology changes.
-
-**What S19 decides (D-132):** *that* we version, and the *mechanism* — a methodology version identifier read from the Configuration Layer, written onto every Computed row, immutable once stamped.
-
-**What S19 deliberately does NOT decide:** the actual v1 numbers. Choosing the real look-back sizes, weightings, and edge thresholds is a substantial modelling exercise and gets its **own dedicated session** before the Opportunities slice. This document sets up the slot; it does not fill it. *(This is the "designing on sand" boundary I flagged — opportunities and Best Picks are structurally designed here, numerically designed later.)*
-
----
-
-## 6. The curated-data landmines the Computed layer must respect
-
-This is where the open questions from S15–S18 get a home. Each is a way the curated data can quietly produce a wrong KPI if the compute step is naïve. The design commitment for each:
-
-### 6.1 Per-measure NULL policy (D-108 → D-129)
-
-`NULL` does **not** mean the same thing for every measure. We proved (S15, 1,232 team-rows, 0 counterexamples): `red_cards IS NULL` ≡ **zero** (safe to treat as 0 in a sum or average), but `expected_goals IS NULL` ≡ **genuinely unknown** (must NOT be treated as 0 — a 0 would drag the average down and lie).
-
-**Design commitment (D-129):** the Computed layer carries a **per-measure classification** — each measure is either *null-means-zero* (fold NULLs in as 0) or *null-means-unknown* (exclude from BOTH numerator and denominator, and report the sample size actually used). This classification is the `null_policy` column on the metric registry (§4.2), seeded from D-108, stamped and auditable — **not** a blanket per-table rule (the blanket "NULL = auto-fail" rule we once had is wrong, D-108). The exact per-column assignment is confirmed against `CURATED_SCHEMA_REFERENCE.md` at implementation.
-
-> **Docs-reconciliation flag:** REQUIREMENTS §6.7 still states the *old* blanket rule — "Filters with null data treat as insufficient sample (auto-fail)." D-108 (S15) overturned that in favour of per-measure handling, and D-129 encodes the correct version. **REQUIREMENTS §6.7 should be updated to match in a later docs pass** so the two documents agree (Rule 8).
-
-### 6.2 Date-windowed coverage, especially xG (D-109 → D-130)
-
-xG coverage is **date-windowed**: 100% null before Feb 2026 for Greece, partial in Feb, full after (D-109). A "last 10 xG average" computed blindly across that boundary silently mixes real values with unknowns — and the `cov_*` boolean flags structurally *cannot* express "covered from this date" (D-109).
-
-**Design commitment (D-130):** xG-family KPIs are **coverage-aware**. A form window computes and reports the fraction of its sample that actually had the measure; below a configurable coverage threshold, the KPI is emitted as **"insufficient coverage"** — never as a confident-looking number built on two data points. This protects the "trusted research" promise directly: we would rather show "not enough data" than a precise-looking lie.
-
-### 6.3 Player identity — dual identity (D-110) & id=0 synthetics (D-124)
-
-*(Relevant at the **player** form slice, which is Phase 2 — noted here so it isn't rediscovered later.)*
-
-- **Dual identity (D-110):** the same player appears under different vendor ids across endpoints; we resolved this with `curated.player_identity_links` (S16). Any player-level aggregation MUST canonicalise `player_id` through that link table **first**, or one player's stats get split across two ids and every per-player rate is wrong.
-- **id=0 synthetics (D-124):** "Unidentified player" rows carry `source_ref` like `"0:{fixture}:{team}:{jersey}"`. These are **not real identities** and must be **excluded from player-identity KPIs** (you can't compute "this player's shot rate" for a player the vendor couldn't name). BUT their match events still happened for the *team* — so their shots/cards still count toward **team** totals. The `"0:%"` marker is the exclusion key (D-124).
-
-**Design commitment (D-131):** player-level compute canonicalises via identity links and excludes `"0:%"` synthetics from player metrics while retaining their events in team aggregates.
-
-### 6.4 Out of scope for KPI compute
-
-`height`/`weight` heterogeneity (D-111 / Q-NEW-BD) is a **player-bio display** concern, not a KPI input — the Computed layer does not consume it. Noted so it isn't accidentally pulled into scope.
-
----
-
-## 7. The slicing roadmap (S20 onward) — *how nothing gets dropped, only sequenced*
-
-This is the section that answers "if we do the Computed layer, do we abandon everything else?" — **no.** The roadmap sequences the remaining work; the side quests slot in at the point where they actually block something.
-
-**Main line (product value):**
-
-1. **S20 — Season Resolver.** The shared primitive (§3.2). Standalone, pure, testable against seasons whose shape we already know (EPL 38-round, Greek split-season, Brazil calendar-year). Nothing downstream can be trusted until this is right, so it goes first.
-2. **S21+ — Team form snapshots.** Built on the resolver, MVP metric set from REQUIREMENTS §4.1, with the D-129/D-130 NULL/coverage policies applied. Likely more than one session (metric families in groups).
-3. **Methodology session** — lock the v1 numbers (§5). Prerequisite for step 4.
-4. **Opportunities engine** (D-030) — needs form snapshots + odds + the methodology numbers.
-5. **Best Picks** (D-034) — a thin, high-edge filter over opportunities; cheap once step 4 exists.
-6. **Phase 2 — Player form snapshots** — where D-131 (identity links + id=0 exclusion) becomes critical.
-
-**Where the side quests slot in (sequenced, not dropped):**
-
-- **Q-NEW-BL (worker exit codes)** → **right before the first scheduled nightly run of the computed chain.** That is the moment execution becomes *unattended*, which is exactly when "exits 0 despite failures" becomes dangerous. It's cheap and it lands the session we wire the nightly cadence — not before (we're still running everything by hand today).
-- **Q-NEW-BK (Brazil venue aliases)** → only when a KPI or feature reads venue. No MVP form metric does, so this waits until venue-based analytics — self-contained, ready when needed.
-- **Q-NEW-BG (lineup mis-slot detector)** → a lineup-data-quality item; affects lineup-derived features, not core team form. Slots in alongside any lineup-consuming feature.
-- **`curated.coaches` (D-112)** → enrichment; slots in when a coach-based feature appears.
-- **Q-NEW-BP / BQ (resolver granularity & split-season scope)** → decided *at the top of S20*, because the resolver can't be built without them.
-
-The point: the flat list of open questions that feels like "everything at once" becomes an **ordered map** the moment we fix the build order. Each item has a *when*.
-
----
-
-## 8. Cross-check discipline — how we trust each number
-
-Our standing lesson (held four straight sessions, S15–S18): **design the cross-check, don't trust the model.** Every computed artifact ships with a designed verification before it's believed:
-
-- **Season Resolver:** for a known team and date, assert the returned fixture set matches a hand-derived list; and the **look-ahead guard** — assert *no* returned fixture has a date ≥ the as-of-date (this is the single check that catches future-leakage, the §3 landmine).
-- **Form base:** recompute one team's last-5 *and* last-13 hit rate for a measure by hand from curated as of a known date, and assert equality against a live query over the form base (proves user-tunable N works); assert idempotency (re-run → identical rows, `created_at` preserved).
-- **NULL policy (D-129):** assert a *null-means-unknown* measure never contributes a 0 to an average — compare the computed denominator against a hand-filtered "rows where the measure is present" count.
-- **Coverage (D-130):** on a team straddling the xG coverage boundary, assert the KPI reports the correct coverage fraction and flips to "insufficient" below threshold.
-- **Opportunities/Best Picks (later):** cross-check platform hit-rate vs bookmaker implied probability against a hand-computed edge on a sample fixture.
-
-Each of these is a *raw-vs-curated / hand-vs-computed* comparison — the exact shape that caught S18's five silently-dropped players.
-
----
-
-## 9. Decisions proposed this session (draft — finalise at close)
-
-| Draft ID | Decision |
+| New KPI kind | Cost |
 |---|---|
-| **D-126** | Computed layer lives in its own `computed` schema; regenerable from Curated; written only by the job-worker (nightly + on-demand). |
-| **D-127** | A single stateless **Season Resolver** `(team_id, as_of_date, tier_scope) → ordered fixtures strictly before as_of_date` is the shared primitive for filter engine, backtest, form-snapshot computer, and opportunities engine. |
-| **D-128** | Team form is stored as an ordered **form base** — one row per `(team_id, match_date, metric_key, split)` with the per-match value + context — **not** as pre-windowed aggregates. Point-in-time via strictly-before ordering; **as-of-date is a query predicate, not a stored key.** User-tunable N / threshold / percentage are applied **at query time** as a bounded (~≤40-row) scan. Optional fixed-window projections may be derived for display/defaults only. |
-| **D-129** | Per-measure NULL policy: each measure classified *null-means-zero* or *null-means-unknown* (seeded from D-108); unknown measures excluded from numerator and denominator with sample size reported. |
-| **D-130** | xG-family (and other date-windowed) KPIs are coverage-aware; below a coverage threshold the KPI is emitted as "insufficient coverage," never as a confident number (from D-109). |
-| **D-131** | Player-level compute canonicalises `player_id` via `player_identity_links` and excludes `"0:%"` synthetics from player metrics while retaining their events in team aggregates (D-110/D-124). Phase 2. |
-| **D-132** | Methodology is versioned: S19 sets the mechanism and the immutable per-row stamp; the actual v1 numbers are deferred to a dedicated methodology session. |
-| **D-133** | Build order: Season Resolver → team form snapshots → methodology → opportunities → Best Picks → (Phase 2) player form; side quests (BL/BK/BG/coaches) sequenced to the slice that first needs them (§7). |
-| **D-134** | **KPIs are data, not columns.** Metric *values* are stored in the long-format **form base** (D-128), fronted by a **metric registry** carrying each KPI's NULL policy (D-129) and coverage-awareness (D-130). Adding a KPI = one registry row (+ a pure function only if new math); no migration, and it works at every user N immediately. We store per-match values, **never** per-window aggregates or user thresholds. Optional derived index-only projection for the hottest fixed-window numbers only if measured perf requires it. |
-| **D-135** | **Freshness is tiered, not one nightly batch.** *Frozen tier* (past-date form) computed once, never recomputed barring a corrected past result. *Hot tier* (upcoming window + its opportunities) refreshed **event-driven / intraday**, per data category independently (odds-trigger ≠ stats-trigger, §4.3), with a nightly full sweep as safety net. Ingestion-sync cadence is a distinct, adjacent lever (REQUIREMENTS §6.6). |
-| **D-136** | **Performance model:** live reads are a **cached, index-only, bounded (~≤40-row) scan** — index on `(team_id, metric_key, split, match_date DESC)`, season/league partitioning + BRIN on date, Redis/Upstash cache invalidated by hot-tier events, optional fast-lane projections, heavy backtests async via Dramatiq. Speed comes from bounded work + indexes + cache, not column count. |
+| A question over measures we already store (e.g. *won by 3+*, *over 1.5 corners*, *won to nil away*) | **One registry row. Zero DDL, zero backfill.** Works instantly across all history. |
+| Needs a measurement we never stored | One nullable column + a backfill from `raw.api_responses` (0 API cost). Unavoidable in *any* design — it is new data. |
 
-## 10. Open questions raised this session
+### 3.3 Base measures are stored **wide**, one row per (entity, fixture) (D-138)
+
+v1 proposed a long/tall table — one row per `(team, match, metric)`. Now that the open-ended part lives in the registry, long format for the *base* is strictly worse:
+
+| | Long (one row per measure) | **Wide (one row per team-match)** |
+|---|---|---|
+| Rows at full scale | ~5.2M | **~350k** |
+| A 4-filter evaluation | 4 index scans, 40 rows each | **1 index scan, 40 rows, reused by all 4** |
+| Adding a derived KPI | registry row | **registry row** (identical) |
+| Adding a base measure | insert rows + backfill | `ALTER TABLE ADD COLUMN` (instant in PG) + backfill |
+| FK integrity | same | same |
+
+The extensibility promise is **preserved intact** — it now lives in the registry, which is where it belongs — while reads get ~15× cheaper. This is the correction v1's framing invited by conflating "measurements" (bounded) with "KPIs" (open-ended).
+
+**Grain: one row per (entity, fixture).** Crucially, the row carries **both perspectives** — `goals_for` *and* `goals_against`, `corners_for` *and* `corners_against`, `yellows_own` *and* `yellows_opp`. So "Goals Conceded" and "Yellow Cards Earned (opp)" need no join to the opponent's row. Two rows per fixture, one per team.
+
+**Home/away is a stored property, not a stored dimension.** The row records `is_home`; the user's Overall/Home/Away context is a `WHERE` clause. v1 implied three stored copies — this is one.
+
+**Context columns** travel on the row because filters and future methodology need them: `match_date`, `is_home`, `opponent_team_id`, `league_season_id`, `group_label` (split seasons, D-100), `competition`, and the **opponent-quality tag as of that date** (§8.1).
+
+*Exact column names are confirmed against `information_schema` / `CURATED_SCHEMA_REFERENCE.md` at implementation — never hand-typed from this document (standing rule).*
+
+### 3.4 Windows are **never** pre-baked (reaffirmed from v1, D-128)
+
+The user controls the window (`last N`, 1–40, **or** `season`), the threshold, and the percentage. The combinatorics — ~40 metrics × 3 contexts × 41 window options × arbitrary threshold × arbitrary percentage — are thousands of possible answers per team, composed across multiple filters. **No table can hold those answers.**
+
+So: **as-of-date is a query predicate** (`match_date < :as_of`), not a stored key; and the final *"≥ threshold in ≥ pct% of last N"* test is computed live over a bounded row set. This is not a compromise — it is both the only structure that honours user-tunable windows *and* the faster one (§7).
+
+**It also enables shapes a pre-baked table structurally cannot serve:** *Unbeaten Streak* and *Winning Streak* are run-lengths over an ordered sequence. You can compute a streak from ordered per-match rows; you cannot recover one from a stored "last-10 average."
+
+---
+
+## 4. Entity grains — teams now, others later, without a migration (D-139)
+
+Teams are not the only thing that accumulates form. The prototype also profiles **referees** (1,352 of them, with CARDS/G, %O2.5, PENS/G, HOME%, a strictness tier); **coaches** are a known entity case (D-112); **venues** are plausible.
+
+**Decision: parallel per-grain tables sharing one column contract and one compute engine** — not a single polymorphic table.
+
+- **Shared contract.** Every form base has the same shape: `entity_id`, `fixture_id`, `match_date`, context columns, base measures. A new grain is a migration from the template + a worker from the template + registry rows — roughly half a session, not a redesign.
+- **Why not polymorphic (`entity_type` + `entity_id`)?** It would cost **foreign-key integrity**, which this project has treated as load-bearing (RESTRICT FKs, zero-orphan verification every session since S7). It would also mix a ~350k-row team table with a ~1k-row referee table under one index.
+- **The registry carries `grain`**, so each metric declares which entity it belongs to.
+
+**MVP builds the team grain only.** Player form is Phase 2 (REQUIREMENTS §6.3). Referee is **post-MVP** (§10). The point of deciding now is that the team table gets shaped as *an instance of a pattern* rather than as a one-off — which is precisely the difference between "add referees later" costing half a session versus a migration.
+
+---
+
+## 5. Point-in-time correctness and the Season Resolver
+
+### 5.1 The rule
+
+> **Every form number is computed *as of* a date and may only see completed fixtures strictly *before* that date.**
+
+When we say "scored in 70% of its last 10," that window is defined relative to a date. For an upcoming match it's today; for a **backtest** of a match played last October it must be the 10 matches before *that* date. Include anything later and the backtest becomes silently, wildly profitable — because it is betting with knowledge of results that hadn't happened. That is **look-ahead bias**, and for a product whose entire proposition is trustworthy research, it is fatal.
+
+### 5.2 The Resolver (D-127, carried from v1)
+
+One **stateless, pure** component answers one question, and every consumer calls it — filter engine, backtest, form-base build, opportunities engine. Sharing the implementation is what makes filter and backtest agree *by construction* rather than by discipline.
+
+### 5.3 The v2 contract — season mode added (D-140)
+
+v1's signature returned "completed fixtures strictly before the as-of-date, in tier-scope, most-recent-first," and treated *last N* as the first N. The screenshots surfaced a second mode we had not designed:
+
+`REQUIREMENTS.md` §4.1 defines `sample` as **`int (1–40)` or `"season"`** — the prototype's **Season** checkbox — and explicitly ties it to **Q-NEW-G**, the very question the Resolver exists to answer. So the contract becomes:
+
+```
+resolve(entity_id, as_of_date, scope) -> ordered fixture list
+    scope = { tier_scope, competition_scope, window_mode }
+    window_mode = LAST_N            → first N of the ordered list
+                | CURRENT_SEASON    → bounded to the entity's season as of as_of_date
+```
+
+**"Current season" must be derived, never taken from the vendor.** S17 proved the vendor's `is_current` flag reports Brazil's current season as 2026 while the complete 2025 season sits in our database (D-045/D-122). Trusting the flag would silently return an empty or wrong window. Derive it from fixture dates within the league-season instead.
+
+**Two open questions gate the build (decide at the top of S21):**
+
+- **Q-NEW-BP — as-of-date granularity.** *Proposed:* the resolver is a pure function evaluated at query time, so the only *materialised* as-of-dates are those the hot-window projection caches (§7.4) — kickoff dates of upcoming fixtures, plus "today." History needs no materialised snapshots at all. This is a simpler answer than v1 implied and falls out of §3.4.
+- **Q-NEW-BQ — split-season scope.** For the Greek Super League (Regular Season → Championship / Relegation groups, D-100), does a Championship-round match share a form window with the team's Regular-Season matches? *Proposed:* **yes — one continuous chronological window**, with `group_label` stored so a future methodology can weight or split them. **This is a sporting-judgement call, not a technical one — confirm explicitly.** It also determines what `CURRENT_SEASON` means for half our launch market.
+
+---
+
+## 6. Freshness and incremental computation
+
+### 6.1 Tiered freshness (D-135, carried; sharpened by §2)
+
+With ~0.35% of fixtures live at any moment, tiering is not an optimisation, it is the obvious shape:
+
+| Tier | What | Cadence | Why |
+|---|---|---|---|
+| **Frozen** | Form rows for past fixtures | Computed **once**; recomputed only if a past result is corrected | History is immutable — 99.65% of the data |
+| **Hot** | The upcoming window + its opportunities + the cached projections | **Event-driven, intraday** + nightly full sweep as safety net | The only slice users query live and the only one whose inputs still move |
+
+### 6.2 Per-category triggers — different clocks, correctly (D-135)
+
+There is no single "sync." Each data category has its own cadence (REQUIREMENTS §6.6): match stats within ~1 h of a fixture ending, lineups every 3–4 h on match days, odds daily plus intraday, standings daily, fixtures nightly plus intraday. The hot tier **subscribes to each independently**:
+
+| Event | Recompute |
+|---|---|
+| Match stats land for a completed fixture | That fixture's 2 form rows; invalidate both teams' cached windows; refresh standings snapshot + league completion |
+| Odds move | Opportunities for the affected fixtures **only** — no form work at all |
+| New upcoming fixtures appear | Warm their teams' hot-window projections |
+
+Different frequencies for odds versus fixtures versus stats fall out **naturally** as independent triggers rather than being bolted onto one monolithic job.
+
+### 6.3 Incremental technique (D-141)
+
+- **Watermarks.** Each (league_season, artifact) carries a high-water mark — the last fixture/timestamp processed. A run processes only what's past it. Restartable by construction.
+- **Affected-set propagation.** A landed result affects a known, small set: the two form rows, the two teams' cached windows, that league-season's standings snapshot and completion. Never a global recompute.
+- **Idempotent upsert on the natural key** — `(entity_id, fixture_id)`. A crashed run resumes without duplication; a re-run overwrites cleanly. This is the transaction-per-unit discipline that carried the ingestion workers through three mid-run interruptions in S17.
+- **Full rebuild always available** as an on-demand job (regenerability, §1.2). Incremental and full must produce identical results — and that equality is itself a cross-check (§11).
+
+---
+
+## 7. Performance — how "ultra-fast" is actually achieved (D-142)
+
+Speed comes from **bounded work, covering indexes, and caching** — not from column count, and not from pre-computing answers.
+
+**1. The work is bounded and constant.** A filter evaluation reads **at most 40 rows** for one team, regardless of whether we hold 1,000 fixtures or 10 million. Small N is the whole game.
+
+**2. One read serves every filter.** Because base measures are wide (§3.3), a 4-filter strategy fetches the team's last-N rows **once** and evaluates all four in a single pass over them, in memory. Long format would have cost four separate scans.
+
+**3. Covering index → index-only scans.** `(entity_id, is_home, match_date DESC)` with the base measures carried via `INCLUDE`, so the hot query is answered from the index without touching the table heap.
+
+**4. Partition + prune.** Partition the form base by season (and/or league_season); add BRIN on `match_date` for near-free range pruning on the large historical partitions.
+
+**5. The hot-window projection (the biggest single win).** For teams with upcoming fixtures, materialise the **last 40 rows** as a single compact record (ordered arrays per measure) in Postgres and/or Redis/Upstash. Evaluating *"≥2 in ≥60% of last 10"* then becomes: **one key read, slice the first 10, count.** No scan, no join — a single round trip plus in-memory arithmetic. Invalidated by the §6.2 events. This is the mature version of the prototype's in-process LRU cache, moved out of process so every server instance shares it.
+
+**6. Batch, never N+1.** A filter run over 614 upcoming fixtures fetches all involved teams' windows in **one** batched query, not 1,228 round trips.
+
+**7. Heavy work is asynchronous.** Backtests scan long histories (targets <10 s typical, <60 s heavy — REQUIREMENTS §8.1) and run as Dramatiq background jobs, never blocking a request. They read the **frozen** tier, which is precisely why freezing history matters.
+
+**8. Measure before adding more.** Targets are <3 s typical filter, <500 ms general endpoint (§8.1). Further materialisation is added **only** where measurement shows a miss. Don't pre-optimise.
+
+---
+
+## 8. Supporting computed artifacts (both missing from v1)
+
+### 8.1 Point-in-time standings (D-143)
+
+**The gap.** Opponent-Quality metrics — *win/scored/BTTS vs top-half or bottom-half* (REQUIREMENTS §4.1) — need to know whether an opponent was top-half **at the time of that match**. `curated.standings` holds a *current/final* table, not a time series, so this is not answerable from Curated. The prototype used final standings as a proxy and shipped a warning: ~90% accurate mid-season, degrading badly early (v2.7 §5.2).
+
+**The decision.** Compute `computed.standings_snapshot` — the league table **as of a date**, derived from completed fixtures before that date. We hold every fixture and every score, so this is exactly computable. It is another frozen-tier artifact (compute once per league-season per matchday, never changes).
+
+**Why it's worth it.** It removes a known-inaccurate proxy from a *research* product, and it's the same "compute once, freeze" pattern we already need. Each form row then stores its opponent-quality tag **as of that date** (§3.3), so the filter never recomputes it.
+
+*Fallback, if measurement shows this is too expensive: keep the final-standings proxy with the visible warning (prototype behaviour). Decide on evidence, not assumption.*
+
+### 8.2 League completion % (D-144)
+
+The scope filter takes **MIN and MAX completion %** (D-011). That is a computed per-league-season value as of a date — completed fixtures ÷ scheduled fixtures — and it sits on essentially every query. Small, but it must exist and be indexed; v1 never named it.
+
+---
+
+## 9. The metric registry (D-145)
+
+The registry is the config table that makes KPIs data. Attributes, several of which came directly from reading the prototype dropdown:
+
+| Attribute | Purpose |
+|---|---|
+| `metric_key`, `display_name`, `category` | identity + UI grouping (Goals / Results / Form / Half Time / Corners / Cards / Shots / Possession / Opponent Quality) |
+| `grain` | which entity (§4) — team / player / referee / … |
+| **`value_source`** | **own row / opponent row / match aggregate** — from the dropdown: *Goals Scored* (own), *Yellow Cards Earned (opp)* (opponent), *Cards Total (match)* (aggregate) |
+| **`value_type`** | **count / boolean / percentage / rating / categorical** — many metrics are per-match booleans (*Clean Sheet*, *Won to Nil*, *BTTS*, *Goalless Draw*, *Winning at HT*, *3+ Cards Match*), not continuous values; this changes how a threshold and a NULL are interpreted |
+| `expression` | the derivation over base measures (§3.2) |
+| `null_policy` | `zero` \| `unknown` (D-129, §10.1) |
+| `coverage_aware` | whether the metric must report coverage (D-130, §10.2) |
+| `methodology_version` | for metrics with tunable numbers (§9.1) |
+| `proxy_warning` | surfaces the Opponent-Quality caveat in the UI (REQUIREMENTS §4.1) |
+
+**Categorical outputs are first-class.** The prototype's referee **strictness tier** (Lenient→Very Strict), its **sample-size band** (HIGH / MEDIUM), and the player card's **verdict** (STRONG PLAY / MARGINAL / AVOID) are metrics whose output is a *category* produced by thresholds. They are pure methodology (§9.1) and must be versioned; v1's registry assumed numbers only.
+
+**Expression mechanism — open (Q-NEW-BS).** A declarative expression covers the simple predicates (`goals_against = 0`); genuinely complex metrics (*Weighted Form*'s recency weighting, streak run-lengths) want a registered pure function keyed by `metric_key`. *Proposed:* support both, with declarative as the default and functions as the escape hatch; decide the exact mechanism at the registry slice.
+
+### 9.1 Methodology versioning (D-132, carried)
+
+Every computed row and every threshold-driven classification carries the **methodology version** that produced it. The mechanism is decided here; **the v1 numbers are not.** Choosing recency weights, edge thresholds, strictness cut-offs, and verdict boundaries is a modelling exercise that gets **its own session** before the opportunities slice. Stamping is what keeps "did this strategy work last season?" answerable across methodology changes.
+
+---
+
+## 10. Curated-data landmines every KPI must respect
+
+### 10.1 Per-measure NULL policy (D-129)
+
+`NULL` does not mean one thing. Proven in S15 across 1,232 team-rows with zero counterexamples: `red_cards IS NULL` ≡ **zero** (fold in as 0), while `expected_goals IS NULL` ≡ **genuinely unknown** (exclude from numerator *and* denominator; report the sample size actually used). Carried as `null_policy` on each registry entry — never a blanket per-table rule.
+
+> **Docs-reconciliation flag (carried from v1, still open):** `REQUIREMENTS.md` §6.7 and `CURATED_SCHEMA_REFERENCE.md` §6.7 both still state the old blanket rule — *"a filter that hits NULL treats it as insufficient sample and auto-fails."* D-108 overturned that. Both should be updated in a later docs pass.
+
+### 10.2 Coverage-aware measures (D-130)
+
+xG coverage is **date-windowed** — 100% null before Feb 2026 for Greece, partial in Feb, full after (D-109) — and the `cov_*` booleans structurally cannot express a date window. So xG-family metrics report the fraction of their sample that actually carried the measure, and below a threshold emit **"insufficient coverage"** rather than a confident-looking number built on two data points. The prototype's HIGH / MEDIUM sample band is the same idea, already validated in the UI.
+
+### 10.3 Player identity (D-131, Phase 2)
+
+Player-grain aggregation must **canonicalise `player_id` through `curated.player_identity_links` first** (D-110) — otherwise one player's stats split across two vendor ids and every per-player rate is wrong. And `source_ref LIKE '0:%'` synthetics ("Unidentified player", D-124) are **excluded from player-identity metrics** but **retained in team aggregates** — their shots and cards really happened for the team; only the identity is absent.
+
+### 10.4 Explicitly out of scope
+
+`height`/`weight` heterogeneity (D-111 / Q-NEW-BD) is a player-bio *display* concern. The Computed layer does not consume it.
+
+---
+
+## 11. Cross-check discipline
+
+Our standing lesson, held four straight sessions: **design the cross-check, don't trust the model.** Each artifact ships with its verification:
+
+| Artifact | Check |
+|---|---|
+| **Season Resolver** | **Look-ahead guard** — assert no returned fixture has `match_date >= as_of_date`. This is *the* check that catches future-leakage. Plus: known-season equality against a hand-derived list (EPL 38-round, Greek split-season, Brazil calendar-year); tier-scope containment; `CURRENT_SEASON` correct where the vendor's `is_current` is wrong (Brazil). |
+| **Form base** | Hand-compute one team's last-5 **and** last-13 hit rate from Curated as of a known date; assert equality against the live query (proves user-tunable N). Assert idempotency (re-run → identical rows, `created_at` preserved). Assert **incremental == full rebuild** on a sample league-season. |
+| **Derived metrics** | For each registry entry, assert the derived value equals an independent hand-computation from Curated on a sample of fixtures — the raw-vs-curated shape that caught S18's five silently-dropped players. |
+| **NULL policy** | Assert an `unknown`-policy measure never contributes a 0 to an average — compare the computed denominator against a hand-filtered "rows where present" count. |
+| **Coverage** | On a Greek team straddling the Feb-2026 xG boundary, assert the reported coverage fraction is right and the metric flips to "insufficient" below threshold. |
+| **Standings snapshot** | Reconstruct a known matchday's table and compare against the real published table. |
+| **Hot projection** | Assert the cached window and a direct query return identical results, and that the documented events invalidate it. |
+
+---
+
+## 12. Roadmap
+
+No time pressure has been stated, so the sequence favours correctness over compression. Sessions are indicative, not promises.
+
+**Main line**
+
+1. **S21 — Season Resolver.** The shared primitive (§5). Opens by settling Q-NEW-BP and Q-NEW-BQ. Pure, standalone, testable against three known league shapes.
+2. **S22 — base-measure schema + the team form-base worker.** The wide table (§3.3), built as an instance of the grain template (§4). Backfill the 996 fixtures we hold.
+3. **S23 — the metric registry + derived-metric evaluation.** Seed the full catalogue from REQUIREMENTS §4.1. Settle Q-NEW-BS.
+4. **S24 — supporting artifacts:** point-in-time standings (§8.1) + league completion (§8.2).
+5. **S25 — the query path + hot-window projection + caching** (§7), measured against the §8.1 targets.
+6. **Methodology session** — lock the v1 numbers (§9.1). Prerequisite for opportunities.
+7. **Opportunities engine** (D-030), then **Best Picks** (D-034).
+8. **Phase 2 — player grain**, where D-131 becomes critical.
+
+**Sequenced side quests (not dropped — each has a *when*)**
+
+| Item | When |
+|---|---|
+| **Q-NEW-BL** — workers exit 0 on failure | Immediately before the first unattended/scheduled run — i.e. the session that wires the §6.2 triggers |
+| **Q-NEW-BK** — Brazil venue aliases | When a venue-based KPI or display first needs it |
+| **Q-NEW-BG** — lineup mis-slot detector | Alongside any lineup-consuming feature |
+| **`curated.coaches`** (D-112) | Coach grain, when a coach feature appears |
+| **Referees** (§13) | **Post-MVP** — Alex's call |
+| REQUIREMENTS §6.7 / schema §6.7 null-rule correction | Next docs pass |
+
+---
+
+## 13. Referees — logged, not built (D-146)
+
+The prototype ships a full referee module: 1,352 referees with CARDS/G, %O2.5 / %O3.5 / %O4.5, PENS/G, GOALS/G, %BTTS, HOME%, a derived strictness tier and sample band, plus a detail view promising card timing, home/away bias and per-league splits.
+
+**Status: nice-to-have, post-MVP.** Recorded so it is visibly *deferred* rather than accidentally lost. What we know:
+
+- **`REQUIREMENTS.md` does not mention referees at all** — the module never entered the rebuild requirements. This design doc is now the record that it exists and was consciously deferred.
+- **The data is already paid for.** `curated.fixtures.referee` is a text column landed on every fixture we hold. **Coverage is unverified** — a read-only check (non-null count, distinct names, split by league; zero API cost) should run before any estimate is trusted.
+- **Most KPIs are derivable today** from fixtures + `match_statistics` + the five penalty counters in `player_match_stats`.
+- **Card timing is not.** It needs minute-level events (`/fixtures/events`), which we do not ingest and which is not in `SYNC_INGESTION_DESIGN.md`. That is an **ingestion** dependency, deferred indefinitely.
+- **Identity is name-only** — no vendor referee id confirmed. That is the D-118/D-120 trap (names are the weakest evidence), mitigated by referee names varying far less than player names. Check for a vendor id before building on names.
+- **Cost when it happens:** ~1 session for the entity + worker + KPIs (the grain template of §4 is what keeps it cheap); card timing is a separate 1–2 sessions plus a backfill.
+
+---
+
+## 14. Decisions proposed (draft — finalise at close)
+
+| ID | Decision |
+|---|---|
+| **D-137** | **Base measures vs derived metrics.** Store the ~15 irreducible measurements; define every derived metric (~25 of the ~40 catalogue) as a **registry entry evaluated at query time**. A new KPI over existing measures = one registry row, zero DDL, zero backfill, instantly valid across all history. |
+| **D-138** | **Base measures are stored wide: one row per `(entity, fixture)`**, carrying both perspectives (for/against) so opponent-derived metrics need no join, with `is_home` as a stored property rather than three stored splits. **Supersedes the long-format element of D-134**; the "KPIs are data, not columns" principle is preserved and now lives in the registry. ~15× fewer rows and one read serving all filters. |
+| **D-139** | **Entity grains are parallel per-grain tables sharing one column contract and one compute engine** — not a polymorphic table. Preserves FK integrity (load-bearing since S7) and per-grain indexing; a new grain costs a template migration + template worker + registry rows. MVP = team grain only. |
+| **D-140** | **Season Resolver v2 adds `CURRENT_SEASON` window mode** (REQUIREMENTS §4.1 `sample = "season"`, Q-NEW-G). **"Current season" is derived from fixture dates, never from the vendor's `is_current` flag** (D-045/D-122 — the flag reports Brazil's current season as 2026 while the complete 2025 season is in our DB). |
+| **D-141** | **Incremental computation via watermarks + affected-set propagation**, idempotent upsert on `(entity_id, fixture_id)`, with a full rebuild always available; incremental and full must produce identical results, and that equality is a cross-check. |
+| **D-142** | **Performance model:** bounded ≤40-row reads; one read serving all filters (enabled by D-138); covering index `(entity_id, is_home, match_date DESC) INCLUDE (measures)`; season/league partitioning + BRIN on date; a **hot-window projection** (last-40 as ordered arrays in Postgres/Redis) reducing a filter to one key read + a slice; batched multi-team fetches; async backtests via Dramatiq; further materialisation only where measurement shows a miss. |
+| **D-143** | **`computed.standings_snapshot` — the league table as of a date**, derived from completed fixtures, replacing the prototype's final-standings proxy for Opponent-Quality metrics. Frozen-tier artifact. Fallback to the proxy-with-warning only if measurement shows it is too expensive. |
+| **D-144** | **`computed.league_completion` — completed ÷ scheduled fixtures per league-season as of a date**, backing the MIN/MAX completion scope filter (D-011). Named here because v1 omitted it. |
+| **D-145** | **Metric registry attribute set**, including three that the prototype dropdown revealed: **`value_source`** (own / opponent / match aggregate), **`value_type`** (count / boolean / percentage / rating / **categorical**), and `proxy_warning`. Categorical, threshold-driven outputs (strictness tier, sample band, verdict) are first-class and methodology-versioned. |
+| **D-146** | **Referees are in-scope-but-deferred (post-MVP), logged in §13** rather than left as an accidental omission from REQUIREMENTS. Data already landed; card timing needs `/fixtures/events` and is deferred indefinitely; coverage check required before any estimate. |
+| **D-147** | **The Filter Engine evaluates all of a strategy's filters in a single pass over one fetched window per team** — a consequence of D-138 that must be honoured by the query layer, not re-derived per filter. |
+| **D-148** | **Design-before-build is reaffirmed as the method for this layer**: v2 exists because eight prototype screenshots, checked against the schema and requirements, surfaced structural gaps (grain generality, season mode, registry attributes, two missing artifacts) that would each have been a migration if found after S21–S22. |
+
+## 15. Open questions
 
 | ID | Question | Proposed default |
 |---|---|---|
-| **Q-NEW-BP** | As-of-date granularity for snapshots. | Snapshot per fixture-kickoff-date + a rolling "today"; confirm at S20 top. |
-| **Q-NEW-BQ** | Split-season (Greek) form-window scope — do Championship-round matches share a window with Regular-Season? | Same continuous chronological window, group recorded for future weighting; confirm at S20 top (sporting-logic call). |
+| **Q-NEW-BP** | As-of-date granularity. | No materialised historical snapshots — the resolver is evaluated at query time; only the hot-window projection is materialised (§5.3, §7.5). Confirm at S21. |
+| **Q-NEW-BQ** | Split-season (Greek) form-window scope — do Championship-round matches share a window with Regular Season? | One continuous chronological window, `group_label` stored for future weighting. **Sporting-judgement call — confirm explicitly at S21.** |
+| **Q-NEW-BR** | The exact base-measure list — which columns are irreducible vs derivable. | Derive from `information_schema` against `curated.match_statistics` + `curated.fixtures` at S22; do not hand-type from this doc. |
+| **Q-NEW-BS** | Derived-metric expression mechanism — declarative expression vs registered pure function. | Support both; declarative default, function escape hatch for Weighted Form / streaks. Decide at the registry slice (S23). |
+| **Q-NEW-BT** | Form-base storage cost at scale (~350k rows × ~30 columns) against the 400 MiB upgrade trigger (D-084, currently 11.74%). | Measure on the 996 fixtures we hold at S22 and extrapolate before committing to partitioning strategy. |
+| **Q-NEW-BU** | Referee coverage in `curated.fixtures.referee` — non-null share, distinct count, per-league split; and whether the vendor exposes a referee **id** anywhere. | Read-only check, 0 API cost. Run before any referee estimate is trusted (§13). |
 
 ---
 
-*End of COMPUTED_LAYER_DESIGN.md (Session 19, proposed). No live tables touched; no code produced. Next: Season Resolver implementation (S20), starting from Q-NEW-BP/BQ.*
+*End of COMPUTED_LAYER_DESIGN.md v2 (Session 20, proposed). No code, no live tables touched. Next: Season Resolver implementation (S21), opening with Q-NEW-BP and Q-NEW-BQ.*
